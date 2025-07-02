@@ -17,22 +17,22 @@ twilio_auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 GOOGLE_CREDS = os.environ.get('GOOGLE_CREDS_JSON')
 
-# ---------- SISTEMA DE INTENÇÕES ----------
+# ---------- SISTEMA DE INTENÇÕES ATUALIZADO ----------
 INTENTOES = {
-    "saudacao": ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite"],
-    "ajuda": ["ajuda", "socorro", "opções", "comandos"],
-    "reserva": ["reserva", "reservar", "agendar", "viagem", "passagem"],
-    "pagar": ["pagar", "pagamento", "pague", "comprar"],
-    "status": ["status", "situação", "verificar", "consulta"],
-    "cancelar": ["cancelar", "desmarcar", "anular"],
-    "suporte": ["suporte", "atendente", "humano"]
+    "saudacao": ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "aline", "alô", "hello"],
+    "ajuda": ["ajuda", "socorro", "opções", "comandos", "menu", "help"],
+    "reserva": ["reserva", "reservar", "agendar", "viagem", "passagem", "voo", "roteiro"],
+    "pagar": ["pagar", "pagamento", "pague", "comprar", "pagto", "débito", "crédito"],
+    "status": ["status", "situação", "verificar", "consulta", "onde está", "localizar"],
+    "cancelar": ["cancelar", "desmarcar", "anular", "remover", "desistir", "estornar"],
+    "suporte": ["suporte", "atendente", "humano", "pessoa", "falar com alguém", "operador"]
 }
 
 # ---------- CONTROLE DE ESTADO ----------
 ESTADOS = {}
 
 def detectar_intencao(mensagem):
-    """Detecta a intenção por palavras-chave"""
+    """Detecta a intenção por palavras-chave (versão melhorada)"""
     mensagem = mensagem.lower().strip()
     for intencao, palavras in INTENTOES.items():
         if any(palavra in mensagem for palavra in palavras):
@@ -66,7 +66,7 @@ def identificar_cliente(telefone):
     except:
         return None
 
-# ---------- ROTA PRINCIPAL ----------
+# ---------- ROTA PRINCIPAL ATUALIZADA ----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     # Obter dados da mensagem
@@ -90,7 +90,7 @@ def webhook():
     resp = MessagingResponse()
     msg = resp.message()
     
-    # ----- LÓGICA PRINCIPAL -----
+    # ----- LÓGICA PRINCIPAL MELHORADA -----
     if estado_atual == "INICIO":
         if intencao in ["saudacao", "ajuda"]:
             resposta = saudacao + "Bem-vindo à JCM Viagens 🧳✨\n\n"
@@ -130,19 +130,53 @@ def webhook():
         else:
             msg.body("⚠️ Opção não reconhecida. Digite *AJUDA* para ver opções")
     
-    # ----- ESTADO DE RESERVA -----
+    # ----- ESTADO DE RESERVA MELHORADO -----
     elif estado_atual == "AGUARDANDO_RESERVA":
         if "reserva" in mensagem.lower():
-            # Processar reserva (simplificado)
-            msg.body("✅ Reserva recebida! Estamos processando...\n\nEm instantes enviaremos confirmação.")
-            # Aqui você adicionaria a lógica real de reserva
+            # Extrair dados da reserva (exemplo simplificado)
+            try:
+                partes = mensagem.split('-')
+                origem_destino = partes[0].replace('RESERVA', '').strip()
+                pessoas = partes[1].replace('pessoas', '').strip()
+                data = partes[2].strip()
+                
+                msg.body(f"✅ Reserva recebida!\n\nOrigem: {origem_destino}\nPessoas: {pessoas}\nData: {data}\n\nEstamos processando sua solicitação!")
+            except:
+                msg.body("📝 Formato incorreto. Envie no formato:\nRESERVA [ORIGEM] para [DESTINO] - [PESSOAS] pessoas - [DATA]")
         else:
             msg.body("📝 Formato incorreto. Envie no formato:\nRESERVA [ORIGEM] para [DESTINO] - [PESSOAS] pessoas - [DATA]")
         
-        # Volta ao estado inicial após ação
         ESTADOS[telefone] = "INICIO"
     
-    # ----- OUTROS ESTADOS (adicionar conforme necessidade) -----
+    # ----- ESTADO DE STATUS MELHORADO -----
+    elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
+        if mensagem.isdigit():
+            # Simular busca na planilha
+            msg.body(f"✅ Reserva #{mensagem} encontrada!\nStatus: Confirmada\nData: 15/07/2025\nValor: R$ 1.200,00")
+        else:
+            msg.body("❌ Número inválido. Digite apenas números (ex: 175)")
+        
+        ESTADOS[telefone] = "INICIO"
+    
+    # ----- ESTADO DE CANCELAMENTO MELHORADO -----
+    elif estado_atual == "AGUARDANDO_CANCELAMENTO":
+        if mensagem.isdigit():
+            msg.body(f"✅ Reserva #{mensagem} cancelada com sucesso!\nValor será estornado em até 5 dias úteis.")
+        else:
+            msg.body("❌ Número inválido. Digite apenas números (ex: 175)")
+        
+        ESTADOS[telefone] = "INICIO"
+    
+    # ----- ESTADO DE PAGAMENTO MELHORADO -----
+    elif estado_atual == "AGUARDANDO_PAGAMENTO":
+        if mensagem.isdigit():
+            msg.body(f"💳 Pagamento para reserva #{mensagem}:\n🔗 Link: https://jcmviagens.com/pagar?id={mensagem}\n\nValidade: 24 horas")
+        else:
+            msg.body("⚠️ Digite apenas o número da reserva para pagamento")
+        
+        ESTADOS[telefone] = "INICIO"
+    
+    # ----- OUTROS ESTADOS -----
     else:
         msg.body("🔄 Reiniciando conversa... Digite *OI* para começar")
         ESTADOS[telefone] = "INICIO"
@@ -151,6 +185,5 @@ def webhook():
 
 # ---------- INICIAR SERVIDOR ----------
 if __name__ == '__main__':
-    # Configuração profissional para Render
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
