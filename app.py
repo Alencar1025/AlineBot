@@ -274,6 +274,14 @@ def webhook():
     
     return str(resp)
 
+# ... (código existente)
+
+# ========== ROTA DE WARM-UP ==========
+@app.route('/warmup')
+def warmup():
+    print("🔥 Instance warmed up!")
+    return "Instance is warm!", 200
+
 # ---------- INICIAR SERVIDOR ----------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
