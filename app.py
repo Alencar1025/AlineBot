@@ -6,9 +6,20 @@ import os
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+import threading
+import time
+import requests
+import logging
+from functools import lru_cache
+import hashlib
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
 app = Flask(__name__)
+
+# Configuração de Logs (Etapa 4)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)  # Só mostra erros
+logging.getLogger('googleapiclient').setLevel(logging.WARNING)
 
 # Autenticação Twilio (preencher no Render)
 twilio_account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
@@ -73,9 +84,14 @@ def conectar_google_sheets():
         print(f"ERRO CONEXÃO GOOGLE: {str(e)}")
         return None
 
+# Cache para Google Sheets (Etapa 2)
+@lru_cache(maxsize=100)
 def identificar_cliente(telefone):
-    """Busca cliente na planilha de recorrentes"""
+    """Busca cliente na planilha de recorrentes (com cache)"""
     try:
+        telefone_hash = hashlib.md5(telefone.encode()).hexdigest()[:8]
+        print(f"🔍 Buscando cliente: {telefone_hash}")
+        
         gc = conectar_google_sheets()
         planilha = gc.open("Clientes_Recorrentes").sheet1
         clientes = planilha.get_all_records()
@@ -88,7 +104,8 @@ def identificar_cliente(telefone):
                 return cliente
         
         return None
-    except:
+    except Exception as e:
+        print(f"ERRO IDENTIFICAÇÃO CLIENTE: {str(e)}")
         return None
 
 def saudacao_personalizada(cliente, primeira_vez):
@@ -286,7 +303,48 @@ def health_check():
     """Endpoint para monitoramento de saúde"""
     return "✅ AlineBot Online", 200
 
+# ========== LIMPEZA AUTOMÁTICA DE MEMÓRIA ========== (Etapa 1)
+def limpeza_automatica():
+    """Remove estados inativos a cada 30 minutos"""
+    while True:
+        time.sleep(1800)  # 30 minutos
+        agora = datetime.now()
+        print("⏰ Verificando estados inativos...")
+        
+        # Criar cópia das chaves para evitar erro durante iteração
+        telefones = list(ESTADOS.keys())
+        
+        for telefone in telefones:
+            estado = ESTADOS[telefone]
+            ultima_interacao = datetime.fromisoformat(estado["ultima_interacao"])
+            
+            # Remover se inativo por mais de 2 horas
+            if (agora - ultima_interacao).total_seconds() > 7200:  # 7200 seg = 2 horas
+                del ESTADOS[telefone]
+                print(f"♻️ Estado removido: {telefone[-4:]}")
+                
+# ========== WARMUP AUTOMÁTICO ========== (Etapa 3)
+def warmup_periodico():
+    """Aciona o warmup a cada 5 minutos para prevenir cold starts"""
+    while True:
+        try:
+            requests.get("https://alinebotjcm.onrender.com/warmup")
+            print("🔥 Warmup automático executado")
+        except Exception as e:
+            print(f"⚠️ Erro no warmup automático: {str(e)}")
+        time.sleep(300)  # 5 minutos
+
 # ---------- INICIAR SERVIDOR ----------
 if __name__ == '__main__':
+    # Iniciar thread de limpeza de memória
+    limpador = threading.Thread(target=limpeza_automatica)
+    limpador.daemon = True
+    limpador.start()
+    
+    # Iniciar thread de warmup automático
+    warmup_thread = threading.Thread(target=warmup_periodico)
+    warmup_thread.daemon = True
+    warmup_thread.start()
+    
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)  # debug=False para produção
