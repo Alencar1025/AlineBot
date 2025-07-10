@@ -12,22 +12,34 @@ import requests
 import logging
 from functools import lru_cache
 import hashlib
+import time
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
 app = Flask(__name__)
 
-# Configuração de Logs (Etapa 4)
+# Configuração de Logs
 log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)  # Só mostra erros
+log.setLevel(logging.ERROR)
 logging.getLogger('googleapiclient').setLevel(logging.WARNING)
 
 # Autenticação Twilio (preencher no Render)
 twilio_account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
 twilio_auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
 
-# Configuração Google Sheets
+# ========== CONFIGURAÇÃO GOOGLE SHEETS ATUALIZADA ==========
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-GOOGLE_CREDS = os.environ.get('GOOGLE_CREDS_JSON')
+GOOGLE_CREDS = {
+    "type": "service_account",
+    "project_id": os.environ.get('GCP_PROJECT_ID'),
+    "private_key_id": os.environ.get('GCP_PRIVATE_KEY_ID'),
+    "private_key": os.environ.get('GCP_PRIVATE_KEY').replace('\\n', '\n'),
+    "client_email": os.environ.get('GCP_CLIENT_EMAIL'),
+    "client_id": os.environ.get('GCP_CLIENT_ID'),
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": os.environ.get('GCP_CERT_URL')
+}
 
 # ---------- SISTEMA DE INTENÇÕES ATUALIZADO ----------
 INTENTOES = {
@@ -42,11 +54,9 @@ INTENTOES = {
 }
 
 # ---------- CONTROLE DE ESTADO AVANÇADO ----------
-# Armazena: {telefone: {"estado": str, "ultima_interacao": timestamp, "primeira_vez": bool}}
 ESTADOS = {}
 
 def obter_periodo_dia():
-    """Retorna a saudação conforme o período do dia"""
     hora_atual = datetime.now().hour
     if 5 <= hora_atual < 12:
         return "Bom dia"
@@ -56,19 +66,15 @@ def obter_periodo_dia():
         return "Boa noite"
 
 def detectar_intencao(mensagem):
-    """Detecta a intenção por palavras-chave com lógica melhorada"""
     mensagem = mensagem.lower().strip()
     
-    # Verificar saudações especiais primeiro
     if any(saudacao in mensagem for saudacao in ["bom dia", "boa tarde", "boa noite"]):
         return "saudacao"
     
-    # Verificar outros comandos
     for intencao, palavras in INTENTOES.items():
         if any(palavra in mensagem for palavra in palavras):
             return intencao
             
-    # Verificação adicional para mensagens curtas
     if len(mensagem) <= 4:
         if mensagem in ["oi", "ola", "olá", "oi!"]:
             return "saudacao"
@@ -76,44 +82,34 @@ def detectar_intencao(mensagem):
     return None
 
 def conectar_google_sheets():
-    """Conecta às planilhas do Google"""
     try:
-        creds = Credentials.from_service_account_info(eval(GOOGLE_CREDS), scopes=SCOPES)
+        creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=SCOPES)
         return gspread.authorize(creds)
     except Exception as e:
         print(f"ERRO CONEXÃO GOOGLE: {str(e)}")
         return None
 
-# Cache para Google Sheets (Etapa 2)
+# ========== FUNÇÃO DE BUSCA EM PLANILHAS ==========
 @lru_cache(maxsize=100)
-def identificar_cliente(telefone):
-    """Busca cliente na planilha de recorrentes (com cache)"""
+def buscar_na_planilha(nome_planilha, coluna_busca, valor_busca):
     try:
-        telefone_hash = hashlib.md5(telefone.encode()).hexdigest()[:8]
-        print(f"🔍 Buscando cliente: {telefone_hash}")
-        
         gc = conectar_google_sheets()
-        planilha = gc.open("Clientes_Recorrentes").sheet1
-        clientes = planilha.get_all_records()
+        planilha = gc.open(nome_planilha).sheet1
+        dados = planilha.get_all_records()
         
-        telefone_limpo = re.sub(r'\D', '', telefone)[-11:]
-        
-        for cliente in clientes:
-            tel_planilha = re.sub(r'\D', '', cliente['Telefone'])[-11:]
-            if telefone_limpo == tel_planilha:
-                return cliente
-        
+        for linha in dados:
+            if str(linha[coluna_busca]).strip() == str(valor_busca).strip():
+                return linha
         return None
     except Exception as e:
-        print(f"ERRO IDENTIFICAÇÃO CLIENTE: {str(e)}")
+        print(f"ERRO BUSCA {nome_planilha}: {str(e)}")
         return None
 
 def saudacao_personalizada(cliente, primeira_vez):
-    """Cria mensagem de saudação personalizada"""
     saudacao_periodo = obter_periodo_dia()
     
     if cliente:
-        nome = cliente.get('Nome', 'cliente VIP').split()[0]  # Pega o primeiro nome
+        nome = cliente.get('Nome', 'cliente VIP').split()[0]
         tratamento = f"{saudacao_periodo}, {nome}!"
     else:
         tratamento = f"{saudacao_periodo}!"
@@ -126,42 +122,31 @@ def saudacao_personalizada(cliente, primeira_vez):
 # ---------- ROTA PRINCIPAL ATUALIZADA ----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Obter dados da mensagem
     from_number = request.values.get('From', '')
     mensagem = request.values.get('Body', '').strip()
     
-    # Normalizar número de telefone
     telefone = re.sub(r'\D', '', from_number)[-11:]
     
-    # Gerenciar estados do usuário
     estado_usuario = ESTADOS.get(telefone, {
         "estado": "INICIO",
         "ultima_interacao": datetime.now().isoformat(),
         "primeira_vez": True
     })
     
-    # Calcular tempo desde a última interação (em minutos)
     ultima_interacao = datetime.fromisoformat(estado_usuario["ultima_interacao"])
     tempo_desde_ultima = (datetime.now() - ultima_interacao).total_seconds() / 60
     
-    # Atualizar registro de interação
     estado_usuario["ultima_interacao"] = datetime.now().isoformat()
     ESTADOS[telefone] = estado_usuario
     
-    # Detectar intenção
     intencao = detectar_intencao(mensagem)
-    
-    # Verificar se é cliente recorrente
     cliente = identificar_cliente(telefone)
     
-    # Inicializar resposta
     resp = MessagingResponse()
     msg = resp.message()
     
-    # ----- LÓGICA PRINCIPAL MELHORADA -----
     estado_atual = estado_usuario["estado"]
     
-    # Se passou mais de 30 minutos desde a última mensagem, reiniciar conversa
     if tempo_desde_ultima > 30 and estado_atual != "INICIO":
         msg.body(f"{obter_periodo_dia()}! Percebi que passou um tempo desde nossa última conversa. Vamos recomeçar?")
         estado_usuario["estado"] = "INICIO"
@@ -169,10 +154,8 @@ def webhook():
         ESTADOS[telefone] = estado_usuario
         return str(resp)
     
-    # Estado INICIO - Saudação
     if estado_atual == "INICIO":
         if intencao in ["saudacao", "ajuda"] or estado_usuario["primeira_vez"]:
-            # Saudação personalizada
             resposta = saudacao_personalizada(cliente, estado_usuario["primeira_vez"])
             resposta += "\n\n*Comandos disponíveis:*\n"
             resposta += "- RESERVA: Nova reserva\n"
@@ -189,14 +172,12 @@ def webhook():
             
         elif intencao == "continuar":
             msg.body("Vamos continuar de onde paramos! Qual era a última ação?")
-            # Aqui você pode implementar lógica para recuperar o contexto anterior
             estado_usuario["estado"] = "AGUARDANDO_ACAO"
             ESTADOS[telefone] = estado_usuario
             
         else:
             msg.body("Não entendi. Digite *OI* para começar ou *AJUDA* para ver opções")
     
-    # Estado AGUARDANDO_ACAO - Menu principal
     elif estado_atual == "AGUARDANDO_ACAO":
         if intencao == "reserva":
             msg.body("✈️ Para reservar, envie:\nRESERVA [ORIGEM] para [DESTINO] - [PESSOAS] pessoas - [DATA]\n\nExemplo:\nRESERVA GRU para São Paulo - 4 pessoas - 20/07")
@@ -220,44 +201,109 @@ def webhook():
         
         elif intencao == "suporte":
             msg.body("⏳ Redirecionando para atendente humano...")
-            # Adicionar lógica para notificar atendente aqui
             estado_usuario["estado"] = "SUPORTE_ATIVO"
             ESTADOS[telefone] = estado_usuario
         
         else:
             msg.body("⚠️ Opção não reconhecida. Digite *AJUDA* para ver opções")
     
-    # ----- ESTADO DE RESERVA -----
+    # ========== FLUXO DE RESERVA INTEGRADO ==========
     elif estado_atual == "AGUARDANDO_RESERVA":
-        if "reserva" in mensagem.lower():
-            # Extrair dados da reserva (exemplo simplificado)
-            try:
-                partes = mensagem.split('-')
-                origem_destino = partes[0].replace('RESERVA', '').strip()
-                pessoas = partes[1].replace('pessoas', '').strip()
-                data = partes[2].strip()
-                
-                msg.body(f"✅ Reserva recebida!\n\nOrigem: {origem_destino}\nPessoas: {pessoas}\nData: {data}\n\nEstamos processando sua solicitação!")
-            except:
-                msg.body("📝 Formato incorreto. Envie no formato:\nRESERVA [ORIGEM] para [DESTINO] - [PESSOAS] pessoas - [DATA]")
-        else:
-            msg.body("📝 Formato incorreto. Envie no formato:\nRESERVA [ORIGEM] para [DESTINO] - [PESSOAS] pessoas - [DATA]")
+        try:
+            partes = mensagem.split('-')
+            origem_destino = partes[0].replace('RESERVA', '').strip()
+            pessoas = int(partes[1].replace('pessoas', '').strip())
+            data_reserva = partes[2].strip()
+            
+            if pessoas <= 4:
+                veiculo = "Sedan"
+                valor = 600.00
+            elif pessoas <= 7:
+                veiculo = "SUV"
+                valor = 750.00
+            else:
+                veiculo = "Van"
+                valor = 900.00
+            
+            id_reserva = f"RES_{int(time.time())}"
+            
+            reserva_data = {
+                "ID_Reserva": id_reserva,
+                "Cliente": telefone,
+                "Data": data_reserva,
+                "Hora_Coleta": "08:00",
+                "ID_Local_Origem": "LOC_005",
+                "ID_Local_Destino": "LOC_001",
+                "Categoria_Veiculo": veiculo,
+                "ID_Motorista": "MOT_001",
+                "Status": "Confirmado",
+                "Valor": valor
+            }
+            
+            # Salvar na planilha
+            gc = conectar_google_sheets()
+            planilha_reservas = gc.open("Reservas_JCM").sheet1
+            planilha_reservas.append_row(list(reserva_data.values()))
+            
+            # Registrar pagamento
+            pagamento_data = {
+                "Reserva_ID": id_reserva,
+                "Motorista": "Alencar",
+                "Valor_Base": valor * 0.8,
+                "Valor_Espera": 0.00,
+                "Comissao_JCM": valor * 0.2,
+                "Ambiente": "Producao",
+                "Status": "Pendente"
+            }
+            planilha_pagamentos = gc.open("Pagamentos_Motoristas_JCM").sheet1
+            planilha_pagamentos.append_row(list(pagamento_data.values()))
+            
+            msg.body(f"✅ Reserva {id_reserva} confirmada!\n\n" 
+                     f"*Detalhes:*\n"
+                     f"- Origem: Aeroporto GRU\n"
+                     f"- Destino: Meliá Campinas\n"
+                     f"- Data: {data_reserva}\n"
+                     f"- Veículo: {veiculo}\n"
+                     f"- Valor: R$ {valor:.2f}\n\n"
+                     f"Pagamento motorista registrado ✅")
+            
+        except Exception as e:
+            msg.body(f"❌ Erro ao processar reserva. Formato correto:\n"
+                     "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
+                     f"Erro técnico: {str(e)}")
         
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
     
-    # ----- ESTADO DE STATUS -----
+    # ========== CONSULTA DE STATUS INTEGRADA ==========
     elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
-        if mensagem.isdigit():
-            # Simular busca na planilha
-            msg.body(f"✅ Reserva #{mensagem} encontrada!\nStatus: Confirmada\nData: 15/07/2025\nValor: R$ 1.200,00")
-        else:
-            msg.body("❌ Número inválido. Digite apenas números (ex: 175)")
+        reserva = buscar_na_planilha("Reservas_JCM", "ID_Reserva", mensagem)
         
+        if reserva:
+            motorista = buscar_na_planilha("Motoristas_JCM", "ID_Contato", reserva["ID_Motorista"])
+            nome_motorista = motorista["Nome"] if motorista else "Não atribuído"
+            
+            origem = buscar_na_planilha("Locais_Especificos_JCM", "ID_Local", reserva["ID_Local_Origem"])
+            destino = buscar_na_planilha("Locais_Especificos_JCM", "ID_Local", reserva["ID_Local_Destino"])
+            
+            nome_origem = origem["Nome"] if origem else "Desconhecido"
+            nome_destino = destino["Nome"] if destino else "Desconhecido"
+            
+            resposta = (f"✅ Reserva *{mensagem}*\n"
+                        f"Status: {reserva['Status']}\n"
+                        f"Data: {reserva['Data']}\n"
+                        f"Origem: {nome_origem}\n"
+                        f"Destino: {nome_destino}\n"
+                        f"Veículo: {reserva['Categoria_Veiculo']}\n"
+                        f"Motorista: {nome_motorista}\n"
+                        f"Valor: R$ {reserva['Valor']:.2f}")
+        else:
+            resposta = "❌ Reserva não encontrada. Verifique o número."
+        
+        msg.body(resposta)
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
     
-    # ----- ESTADO DE CANCELAMENTO -----
     elif estado_atual == "AGUARDANDO_CANCELAMENTO":
         if mensagem.isdigit():
             msg.body(f"✅ Reserva #{mensagem} cancelada com sucesso!\nValor será estornado em até 5 dias úteis.")
@@ -267,7 +313,6 @@ def webhook():
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
     
-    # ----- ESTADO DE PAGAMENTO -----
     elif estado_atual == "AGUARDANDO_PAGAMENTO":
         if mensagem.isdigit():
             msg.body(f"💳 Pagamento para reserva #{mensagem}:\n🔗 Link: https://jcmviagens.com/pagar?id={mensagem}\n\nValidade: 24 horas")
@@ -277,13 +322,11 @@ def webhook():
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
     
-    # ----- ESTADO DE SUPORTE -----
     elif estado_atual == "SUPORTE_ATIVO":
         msg.body("⌛ Um atendente humano já foi notificado e entrará em contato em breve!")
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
     
-    # ----- OUTROS ESTADOS -----
     else:
         msg.body("🔄 Reiniciando conversa... Digite *OI* para começar")
         estado_usuario["estado"] = "INICIO"
@@ -291,7 +334,18 @@ def webhook():
     
     return str(resp)
 
-# ========== ROTA DE WARM-UP ==========
+# ========== ROTA DE TESTE DE PLANILHAS ==========
+@app.route('/teste-sheets')
+def teste_sheets():
+    try:
+        gc = conectar_google_sheets()
+        planilha = gc.open("Reservas_JCM").sheet1
+        primeira_linha = planilha.row_values(1)
+        return f"Conexão OK! Cabeçalhos: {primeira_linha}"
+    except Exception as e:
+        return f"ERRO: {str(e)}"
+
+# ========== WARMUP ==========
 @app.route('/warmup')
 def warmup():
     print("🔥 Instance warmed up!")
@@ -300,51 +354,44 @@ def warmup():
 # ========== HEALTH CHECK ==========
 @app.route('/healthz')
 def health_check():
-    """Endpoint para monitoramento de saúde"""
     return "✅ AlineBot Online", 200
 
-# ========== LIMPEZA AUTOMÁTICA DE MEMÓRIA ========== (Etapa 1)
+# ========== LIMPEZA AUTOMÁTICA DE MEMÓRIA ==========
 def limpeza_automatica():
-    """Remove estados inativos a cada 30 minutos"""
     while True:
-        time.sleep(1800)  # 30 minutos
+        time.sleep(1800)
         agora = datetime.now()
         print("⏰ Verificando estados inativos...")
         
-        # Criar cópia das chaves para evitar erro durante iteração
         telefones = list(ESTADOS.keys())
         
         for telefone in telefones:
             estado = ESTADOS[telefone]
             ultima_interacao = datetime.fromisoformat(estado["ultima_interacao"])
             
-            # Remover se inativo por mais de 2 horas
-            if (agora - ultima_interacao).total_seconds() > 7200:  # 7200 seg = 2 horas
+            if (agora - ultima_interacao).total_seconds() > 7200:
                 del ESTADOS[telefone]
                 print(f"♻️ Estado removido: {telefone[-4:]}")
                 
-# ========== WARMUP AUTOMÁTICO ========== (Etapa 3)
+# ========== WARMUP AUTOMÁTICO ==========
 def warmup_periodico():
-    """Aciona o warmup a cada 5 minutos para prevenir cold starts"""
     while True:
         try:
             requests.get("https://alinebotjcm.onrender.com/warmup")
             print("🔥 Warmup automático executado")
         except Exception as e:
             print(f"⚠️ Erro no warmup automático: {str(e)}")
-        time.sleep(300)  # 5 minutos
+        time.sleep(300)
 
 # ---------- INICIAR SERVIDOR ----------
 if __name__ == '__main__':
-    # Iniciar thread de limpeza de memória
     limpador = threading.Thread(target=limpeza_automatica)
     limpador.daemon = True
     limpador.start()
     
-    # Iniciar thread de warmup automático
     warmup_thread = threading.Thread(target=warmup_periodico)
     warmup_thread.daemon = True
     warmup_thread.start()
     
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)  # debug=False para produção
+    app.run(host='0.0.0.0', port=port, debug=False)
