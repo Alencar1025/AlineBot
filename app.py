@@ -55,64 +55,42 @@ INTENTOES = {
 
 # ---------- CONTROLE DE ESTADO AVANÇADO ----------
 ESTADOS = {}
+BLOQUEIO_TEMPORARIO = {}
 
-def obter_periodo_dia():
-    hora_atual = datetime.now().hour
-    if 5 <= hora_atual < 12:
-        return "Bom dia"
-    elif 12 <= hora_atual < 18:
-        return "Boa tarde"
-    else:
-        return "Boa noite"
+# ---------- ROTA PRINCIPAL ATUALIZADA ----------
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    from_number = request.values.get('From', '')
+    mensagem = request.values.get('Body', '').strip()
+    
+    telefone = re.sub(r'\D', '', from_number)[-11:]
+    
+    # Verificar bloqueio temporário
+    if BLOQUEIO_TEMPORARIO.get(telefone):
+        resp = MessagingResponse()
+        msg = resp.message()
+        msg.body("⏳ Estamos processando sua solicitação anterior. Por favor aguarde...")
+        return str(resp)
+    
+    estado_usuario = ESTADOS.get(telefone, {
+        "estado": "INICIO",
+        "ultima_interacao": datetime.now().isoformat(),
+        "primeira_vez": True,
+        "dados_reserva": {}
+    })
+    
 
-def detectar_intencao(mensagem):
-    mensagem = mensagem.lower().strip()
-    
-    if any(saudacao in mensagem for saudacao in ["bom dia", "boa tarde", "boa noite"]):
-        return "saudacao"
-    
-    for intencao, palavras in INTENTOES.items():
-        if any(palavra in mensagem for palavra in palavras):
-            return intencao
+            # ... (restante do código de reserva) ...
             
-    if len(mensagem) <= 4:
-        if mensagem in ["oi", "ola", "olá", "oi!"]:
-            return "saudacao"
+        except Exception as e:
+            print(f"ERRO RESERVA: {str(e)}")
+            msg.body("❌ Por favor, use exatamente:\nRESERVA [origem] para [destino] - [nº] pessoas - [dd/mm/aaaa]")
+        finally:
+            BLOQUEIO_TEMPORARIO.pop(telefone, None)
+            estado_usuario["estado"] = "INICIO"
+            ESTADOS[telefone] = estado_usuario
     
-    return None
-
-def conectar_google_sheets():
-    try:
-        if not GOOGLE_CREDS:
-            print("❌ Credenciais Google não disponíveis!")
-            return None
-            
-        # Extrair e formatar a chave privada corretamente
-        private_key = GOOGLE_CREDS.get('private_key', '')
-        private_key = private_key.replace('\\\\n', '\n')  # Para ambientes Windows/Linux
-        private_key = private_key.replace('\\n', '\n')     # Para ambientes Render/Cloud
-        
-        # Criar credenciais com a chave formatada
-        creds_info = {
-            "type": GOOGLE_CREDS["type"],
-            "project_id": GOOGLE_CREDS["project_id"],
-            "private_key_id": GOOGLE_CREDS["private_key_id"],
-            "private_key": private_key,
-            "client_email": GOOGLE_CREDS["client_email"],
-            "client_id": GOOGLE_CREDS["client_id"],
-            "auth_uri": GOOGLE_CREDS["auth_uri"],
-            "token_uri": GOOGLE_CREDS["token_uri"],
-            "auth_provider_x509_cert_url": GOOGLE_CREDS["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": GOOGLE_CREDS["client_x509_cert_url"],
-            "universe_domain": GOOGLE_CREDS.get("universe_domain", "googleapis.com")
-        }
-        
-        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-        return gspread.authorize(creds)
-    except Exception as e:
-        print(f"ERRO CONEXÃO GOOGLE: {str(e)}")
-        return None
-
+    # ... (restante do código) ...
 # ========== FUNÇÃO DE BUSCA EM PLANILHAS ==========
 @lru_cache(maxsize=100)
 def buscar_na_planilha(nome_planilha, coluna_busca, valor_busca):
