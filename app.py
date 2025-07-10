@@ -57,40 +57,50 @@ INTENTOES = {
 ESTADOS = {}
 BLOQUEIO_TEMPORARIO = {}
 
-# ---------- ROTA PRINCIPAL ATUALIZADA ----------
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    from_number = request.values.get('From', '')
-    mensagem = request.values.get('Body', '').strip()
-    
-    telefone = re.sub(r'\D', '', from_number)[-11:]
-    
-    # Verificar bloqueio temporário
-    if BLOQUEIO_TEMPORARIO.get(telefone):
-        resp = MessagingResponse()
-        msg = resp.message()
-        msg.body("⏳ Estamos processando sua solicitação anterior. Por favor aguarde...")
-        return str(resp)
-    
-    estado_usuario = ESTADOS.get(telefone, {
-        "estado": "INICIO",
-        "ultima_interacao": datetime.now().isoformat(),
-        "primeira_vez": True,
-        "dados_reserva": {}
-    })
-    
+def obter_periodo_dia():
+    hora_atual = datetime.now().hour
+    if 5 <= hora_atual < 12:
+        return "Bom dia"
+    elif 12 <= hora_atual < 18:
+        return "Boa tarde"
+    else:
+        return "Boa noite"
 
-            # ... (restante do código de reserva) ...
-            
-        except Exception as e:
-            print(f"ERRO RESERVA: {str(e)}")
-            msg.body("❌ Por favor, use exatamente:\nRESERVA [origem] para [destino] - [nº] pessoas - [dd/mm/aaaa]")
-        finally:
-            BLOQUEIO_TEMPORARIO.pop(telefone, None)
-            estado_usuario["estado"] = "INICIO"
-            ESTADOS[telefone] = estado_usuario
+def detectar_intencao(mensagem):
+    mensagem = mensagem.lower().strip()
     
-    # ... (restante do código) ...
+    if any(saudacao in mensagem for saudacao in ["bom dia", "boa tarde", "boa noite"]):
+        return "saudacao"
+    
+    for intencao, palavras in INTENTOES.items():
+        if any(palavra in mensagem for palavra in palavras):
+            return intencao
+            
+    if len(mensagem) <= 4:
+        if mensagem in ["oi", "ola", "olá", "oi!"]:
+            return "saudacao"
+    
+    return None
+
+def conectar_google_sheets():
+    try:
+        if not GOOGLE_CREDS:
+            print("❌ Credenciais Google não disponíveis!")
+            return None
+            
+        # Clonar o dicionário de credenciais
+        fixed_creds = GOOGLE_CREDS.copy()
+        
+        # Corrigir a chave privada
+        if 'private_key' in fixed_creds:
+            fixed_creds['private_key'] = fixed_creds['private_key'].replace('\\\\n', '\n').replace('\\n', '\n')
+        
+        creds = Credentials.from_service_account_info(fixed_creds, scopes=SCOPES)
+        return gspread.authorize(creds)
+    except Exception as e:
+        print(f"ERRO CONEXÃO GOOGLE: {str(e)}")
+        return None
+
 # ========== FUNÇÃO DE BUSCA EM PLANILHAS ==========
 @lru_cache(maxsize=100)
 def buscar_na_planilha(nome_planilha, coluna_busca, valor_busca):
@@ -115,12 +125,10 @@ def buscar_na_planilha(nome_planilha, coluna_busca, valor_busca):
 def identificar_cliente(telefone):
     """Busca informações do cliente na planilha"""
     try:
-        # Buscar na planilha de clientes especiais
         cliente = buscar_na_planilha("Clientes_Especiais_JCM", "Telefone", telefone)
         if cliente:
             return cliente
         
-        # Se não encontrado, retorna um cliente padrão
         return {
             "Nome": "Cliente JCM",
             "Telefone": telefone,
@@ -151,6 +159,13 @@ def webhook():
     mensagem = request.values.get('Body', '').strip()
     
     telefone = re.sub(r'\D', '', from_number)[-11:]
+    
+    # Verificar bloqueio temporário
+    if BLOQUEIO_TEMPORARIO.get(telefone):
+        resp = MessagingResponse()
+        msg = resp.message()
+        msg.body("⏳ Estamos processando sua solicitação anterior. Por favor aguarde...")
+        return str(resp)
     
     estado_usuario = ESTADOS.get(telefone, {
         "estado": "INICIO",
@@ -205,7 +220,6 @@ def webhook():
     
     elif estado_atual == "AGUARDANDO_ACAO":
         if intencao == "reserva":
-            # Mensagem mais clara com exemplo não executável
             msg.body("✈️ Para fazer uma reserva, envie no seguinte formato:\n\n"
                      "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
                      "*Exemplo:*\n"
@@ -240,44 +254,22 @@ def webhook():
     # ========== FLUXO DE RESERVA INTEGRADO ==========
     elif estado_atual == "AGUARDANDO_RESERVA":
         try:
-            # Verificar se é um comando de exemplo
-            if "exemplo" in mensagem.lower() or "como" in mensagem.lower():
-                msg.body("Por favor, envie sua reserva REAL no formato:\n\n"
-                         "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
-                         "Substitua os valores entre colchetes com suas informações.")
-                return str(resp)
-                
-            # Validação básica do formato
-            if '-' not in mensagem or 'para' not in mensagem:
+            BLOQUEIO_TEMPORARIO[telefone] = True
+            
+            # Novo padrão regex melhorado
+            padrao = r'RESERVA\s+(.+?)\s+para\s+(.+?)\s+-\s+(\d+)\s+pessoas?\s+-\s+(\d{1,2}/\d{1,2}/\d{4})'
+            match = re.search(padrao, mensagem, re.IGNORECASE)
+            
+            if not match:
                 raise ValueError("Formato inválido")
                 
-            # Extrair partes da mensagem
-            partes = [part.strip() for part in mensagem.split('-')]
-            if len(partes) < 3:
-                raise ValueError("Faltam partes na reserva")
-                
-            origem_destino = partes[0].replace('RESERVA', '').strip()
-            pessoas_part = partes[1].replace('pessoas', '').replace('pessoa', '').strip()
-            data_reserva = partes[2].strip()
-            
-            # Extrair origem e destino
-            if ' para ' not in origem_destino:
-                raise ValueError("Formato origem-destino inválido")
-                
-            origem, destino = origem_destino.split(' para ', 1)
-            origem = origem.strip()
-            destino = destino.strip()
-            
-            # Validar número de pessoas
-            try:
-                pessoas = int(pessoas_part)
-            except ValueError:
-                raise ValueError("Número de pessoas inválido")
+            origem = match.group(1).strip()
+            destino = match.group(2).strip()
+            pessoas = int(match.group(3))
+            data_reserva = match.group(4)
             
             # Determinar veículo e valor
-            if pessoas <= 0:
-                raise ValueError("Número de pessoas deve ser positivo")
-            elif pessoas <= 4:
+            if pessoas <= 4:
                 veiculo = "Sedan"
                 valor = 600.00
             elif pessoas <= 7:
@@ -294,15 +286,15 @@ def webhook():
                 "Cliente": telefone,
                 "Data": data_reserva,
                 "Hora_Coleta": "08:00",
-                "ID_Local_Origem": "LOC_005",  # Aeroporto GRU
-                "ID_Local_Destino": "LOC_001",  # Meliá Campinas
+                "ID_Local_Origem": "LOC_005",
+                "ID_Local_Destino": "LOC_001",
                 "Categoria_Veiculo": veiculo,
-                "ID_Motorista": "MOT_001",  # Alencar
+                "ID_Motorista": "MOT_001",
                 "Status": "Confirmado",
                 "Valor": valor
             }
             
-            # Salvar na planilha com verificação de conexão
+            # Salvar na planilha
             gc = conectar_google_sheets()
             if gc:
                 planilha_reservas = gc.open("Reservas_JCM").sheet1
@@ -333,16 +325,12 @@ def webhook():
                 msg.body("❌ Erro na conexão com o Google Sheets. Tente novamente mais tarde.")
             
         except Exception as e:
-            # Não mostrar erro técnico ao usuário
             print(f"ERRO RESERVA: {str(e)}")
-            msg.body("❌ Formato incorreto! Por favor, envie:\n\n"
-                     "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
-                     "*Exemplo:*\n"
-                     "RESERVA Aeroporto GRU para Hotel Campinas - 4 pessoas - 25/07/2025\n\n"
-                     "Certifique-se de usar o formato exato.")
-        
-        estado_usuario["estado"] = "INICIO"
-        ESTADOS[telefone] = estado_usuario
+            msg.body("❌ Por favor, use exatamente:\nRESERVA [origem] para [destino] - [nº] pessoas - [dd/mm/aaaa]")
+        finally:
+            BLOQUEIO_TEMPORARIO.pop(telefone, None)
+            estado_usuario["estado"] = "INICIO"
+            ESTADOS[telefone] = estado_usuario
     
     # ========== CONSULTA DE STATUS INTEGRADA ==========
     elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
@@ -444,7 +432,6 @@ def debug_creds():
         return jsonify({"status": "error", "message": "Credenciais não carregadas"})
     
     try:
-        # Verificar informações básicas
         debug_info = {
             "status": "success",
             "client_email": GOOGLE_CREDS.get("client_email", ""),
@@ -486,7 +473,7 @@ def limpeza_automatica():
             if (agora - ultima_interacao).total_seconds() > 7200:
                 del ESTADOS[telefone]
                 print(f"♻️ Estado removido: {telefone[-4:]}")
-                
+
 # ========== WARMUP AUTOMÁTICO ==========
 def warmup_periodico():
     while True:
