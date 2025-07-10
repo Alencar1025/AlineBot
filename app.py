@@ -11,10 +11,8 @@ import time
 import requests
 import logging
 from functools import lru_cache
-import hashlib
 import time
 import json
-from google.auth.crypt import RSASigner
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
 app = Flask(__name__)
@@ -93,7 +91,8 @@ def conectar_google_sheets():
         # Corrigir as quebras de linha na chave privada
         fixed_creds = GOOGLE_CREDS.copy()
         if 'private_key' in fixed_creds:
-            fixed_creds['private_key'] = fixed_creds['private_key'].replace('\\n', '\n')
+            # Remover todas as barras extras e formatar corretamente
+            fixed_creds['private_key'] = fixed_creds['private_key'].replace('\\\\n', '\n').replace('\\n', '\n')
             
         creds = Credentials.from_service_account_info(fixed_creds, scopes=SCOPES)
         return gspread.authorize(creds)
@@ -215,7 +214,12 @@ def webhook():
     
     elif estado_atual == "AGUARDANDO_ACAO":
         if intencao == "reserva":
-            msg.body("✈️ Para reservar, envie:\nRESERVA [ORIGEM] para [DESTINO] - [PESSOAS] pessoas - [DATA]\n\nExemplo:\nRESERVA GRU para São Paulo - 4 pessoas - 20/07")
+            # Mensagem mais clara com exemplo não executável
+            msg.body("✈️ Para fazer uma reserva, envie no seguinte formato:\n\n"
+                     "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
+                     "*Exemplo:*\n"
+                     "RESERVA GRU para Campinas - 4 pessoas - 25/07/2025\n\n"
+                     "Por favor, substitua os valores entre colchetes com suas informações reais.")
             estado_usuario["estado"] = "AGUARDANDO_RESERVA"
             ESTADOS[telefone] = estado_usuario
         
@@ -225,12 +229,12 @@ def webhook():
             ESTADOS[telefone] = estado_usuario
         
         elif intencao == "status":
-            msg.body("🔍 Digite o número da reserva para verificar o status:")
+            msg.body("🔍 Digite o número completo da reserva (ex: RES_123456) para verificar o status:")
             estado_usuario["estado"] = "AGUARDANDO_NUMERO_RESERVA"
             ESTADOS[telefone] = estado_usuario
         
         elif intencao == "cancelar":
-            msg.body("❌ Digite o número da reserva que deseja cancelar:")
+            msg.body("❌ Digite o número completo da reserva que deseja cancelar (ex: RES_123456):")
             estado_usuario["estado"] = "AGUARDANDO_CANCELAMENTO"
             ESTADOS[telefone] = estado_usuario
         
@@ -245,16 +249,44 @@ def webhook():
     # ========== FLUXO DE RESERVA INTEGRADO ==========
     elif estado_atual == "AGUARDANDO_RESERVA":
         try:
+            # Verificar se é um comando de exemplo
+            if "exemplo" in mensagem.lower() or "como" in mensagem.lower():
+                msg.body("Por favor, envie sua reserva REAL no formato:\n\n"
+                         "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
+                         "Substitua os valores entre colchetes com suas informações.")
+                return str(resp)
+                
             # Validação básica do formato
             if '-' not in mensagem or 'para' not in mensagem:
                 raise ValueError("Formato inválido")
                 
-            partes = mensagem.split('-')
+            # Extrair partes da mensagem
+            partes = [part.strip() for part in mensagem.split('-')]
+            if len(partes) < 3:
+                raise ValueError("Faltam partes na reserva")
+                
             origem_destino = partes[0].replace('RESERVA', '').strip()
-            pessoas = int(partes[1].replace('pessoas', '').strip())
+            pessoas_part = partes[1].replace('pessoas', '').replace('pessoa', '').strip()
             data_reserva = partes[2].strip()
             
-            if pessoas <= 4:
+            # Extrair origem e destino
+            if ' para ' not in origem_destino:
+                raise ValueError("Formato origem-destino inválido")
+                
+            origem, destino = origem_destino.split(' para ', 1)
+            origem = origem.strip()
+            destino = destino.strip()
+            
+            # Validar número de pessoas
+            try:
+                pessoas = int(pessoas_part)
+            except ValueError:
+                raise ValueError("Número de pessoas inválido")
+            
+            # Determinar veículo e valor
+            if pessoas <= 0:
+                raise ValueError("Número de pessoas deve ser positivo")
+            elif pessoas <= 4:
                 veiculo = "Sedan"
                 valor = 600.00
             elif pessoas <= 7:
@@ -300,8 +332,8 @@ def webhook():
                 
                 msg.body(f"✅ Reserva {id_reserva} confirmada!\n\n" 
                          f"*Detalhes:*\n"
-                         f"- Origem: Aeroporto GRU\n"
-                         f"- Destino: Meliá Campinas\n"
+                         f"- Origem: {origem}\n"
+                         f"- Destino: {destino}\n"
                          f"- Data: {data_reserva}\n"
                          f"- Veículo: {veiculo}\n"
                          f"- Valor: R$ {valor:.2f}\n\n"
@@ -310,10 +342,13 @@ def webhook():
                 msg.body("❌ Erro na conexão com o Google Sheets. Tente novamente mais tarde.")
             
         except Exception as e:
-            msg.body(f"❌ Erro ao processar reserva. Formato correto:\n"
+            # Não mostrar erro técnico ao usuário
+            print(f"ERRO RESERVA: {str(e)}")
+            msg.body("❌ Formato incorreto! Por favor, envie:\n\n"
                      "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
-                     f"Exemplo: RESERVA GRU para Campinas - 4 pessoas - 20/07/2025\n\n"
-                     f"Erro técnico: {str(e)}")
+                     "*Exemplo:*\n"
+                     "RESERVA Aeroporto GRU para Hotel Campinas - 4 pessoas - 25/07/2025\n\n"
+                     "Certifique-se de usar o formato exato.")
         
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
@@ -321,12 +356,12 @@ def webhook():
     # ========== CONSULTA DE STATUS INTEGRADA ==========
     elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
         try:
-            # Validação básica do formato do ID
-            if not mensagem.startswith("RES_"):
-                msg.body("❌ Formato de reserva inválido! Deve começar com RES_")
-                return str(resp)
-                
-            reserva = buscar_na_planilha("Reservas_JCM", "ID_Reserva", mensagem)
+            # Normalizar o ID da reserva
+            reserva_id = mensagem.strip().upper()
+            if not reserva_id.startswith("RES_"):
+                reserva_id = "RES_" + reserva_id
+            
+            reserva = buscar_na_planilha("Reservas_JCM", "ID_Reserva", reserva_id)
             
             if reserva:
                 # Buscar motorista associado
@@ -340,7 +375,7 @@ def webhook():
                 nome_origem = origem["Nome"] if origem else "Desconhecido"
                 nome_destino = destino["Nome"] if destino else "Desconhecido"
                 
-                resposta = (f"✅ Reserva *{mensagem}*\n"
+                resposta = (f"✅ Reserva *{reserva_id}*\n"
                             f"Status: {reserva['Status']}\n"
                             f"Data: {reserva['Data']}\n"
                             f"Origem: {nome_origem}\n"
@@ -349,7 +384,7 @@ def webhook():
                             f"Motorista: {nome_motorista}\n"
                             f"Valor: R$ {reserva['Valor']:.2f}")
             else:
-                resposta = "❌ Reserva não encontrada. Verifique o número."
+                resposta = f"❌ Reserva {reserva_id} não encontrada. Verifique o número."
         except Exception as e:
             resposta = f"❌ Erro ao buscar reserva: {str(e)}"
         
@@ -358,8 +393,13 @@ def webhook():
         ESTADOS[telefone] = estado_usuario
     
     elif estado_atual == "AGUARDANDO_CANCELAMENTO":
-        if mensagem.startswith("RES_") and len(mensagem) > 4:
-            msg.body(f"✅ Reserva #{mensagem} cancelada com sucesso!\nValor será estornado em até 5 dias úteis.")
+        # Normalizar o ID da reserva
+        reserva_id = mensagem.strip().upper()
+        if not reserva_id.startswith("RES_"):
+            reserva_id = "RES_" + reserva_id
+        
+        if len(reserva_id) > 4:
+            msg.body(f"✅ Reserva #{reserva_id} cancelada com sucesso!\nValor será estornado em até 5 dias úteis.")
         else:
             msg.body("❌ Número inválido. Digite o ID completo da reserva (ex: RES_123456)")
         
@@ -367,8 +407,13 @@ def webhook():
         ESTADOS[telefone] = estado_usuario
     
     elif estado_atual == "AGUARDANDO_PAGAMENTO":
-        if mensagem.startswith("RES_"):
-            msg.body(f"💳 Pagamento para reserva #{mensagem}:\n🔗 Link: https://jcmviagens.com/pagar?id={mensagem}\n\nValidade: 24 horas")
+        # Normalizar o ID da reserva
+        reserva_id = mensagem.strip().upper()
+        if not reserva_id.startswith("RES_"):
+            reserva_id = "RES_" + reserva_id
+        
+        if len(reserva_id) > 4:
+            msg.body(f"💳 Pagamento para reserva #{reserva_id}:\n🔗 Link: https://jcmviagens.com/pagar?id={reserva_id}\n\nValidade: 24 horas")
         else:
             msg.body("⚠️ Digite o número completo da reserva para pagamento (ex: RES_123456)")
         
@@ -400,19 +445,6 @@ def teste_sheets():
             return "❌ Falha na conexão com Google Sheets"
     except Exception as e:
         return f"ERRO: {str(e)}"
-
-# ========== ROTA DE DIAGNÓSTICO DE CREDENCIAIS ==========
-@app.route('/check-creds')
-def check_creds():
-    if not GOOGLE_CREDS:
-        return "Credenciais não carregadas!"
-    
-    try:
-        # Verificar se a chave privada é válida
-        signer = RSASigner.from_string(GOOGLE_CREDS['private_key'].replace('\\n', '\n'))
-        return "✅ Chave privada válida!"
-    except Exception as e:
-        return f"❌ Erro na chave privada: {str(e)}"
 
 # ========== WARMUP ==========
 @app.route('/warmup')
