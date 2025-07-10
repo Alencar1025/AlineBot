@@ -13,7 +13,8 @@ import logging
 from functools import lru_cache
 import hashlib
 import time
-import json  # Adicionado para processar o JSON
+import json
+from google.auth.crypt import RSASigner
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
 app = Flask(__name__)
@@ -89,7 +90,12 @@ def conectar_google_sheets():
             print("❌ Credenciais Google não disponíveis!")
             return None
             
-        creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=SCOPES)
+        # Corrigir as quebras de linha na chave privada
+        fixed_creds = GOOGLE_CREDS.copy()
+        if 'private_key' in fixed_creds:
+            fixed_creds['private_key'] = fixed_creds['private_key'].replace('\\n', '\n')
+            
+        creds = Credentials.from_service_account_info(fixed_creds, scopes=SCOPES)
         return gspread.authorize(creds)
     except Exception as e:
         print(f"ERRO CONEXÃO GOOGLE: {str(e)}")
@@ -113,6 +119,25 @@ def buscar_na_planilha(nome_planilha, coluna_busca, valor_busca):
         return None
     except Exception as e:
         print(f"ERRO BUSCA {nome_planilha}: {str(e)}")
+        return None
+
+# ========== IDENTIFICAÇÃO DO CLIENTE ==========
+def identificar_cliente(telefone):
+    """Busca informações do cliente na planilha"""
+    try:
+        # Buscar na planilha de clientes especiais
+        cliente = buscar_na_planilha("Clientes_Especiais_JCM", "Telefone", telefone)
+        if cliente:
+            return cliente
+        
+        # Se não encontrado, retorna um cliente padrão
+        return {
+            "Nome": "Cliente JCM",
+            "Telefone": telefone,
+            "Tipo": "Regular"
+        }
+    except Exception as e:
+        print(f"Erro ao identificar cliente: {str(e)}")
         return None
 
 def saudacao_personalizada(cliente, primeira_vez):
@@ -220,6 +245,10 @@ def webhook():
     # ========== FLUXO DE RESERVA INTEGRADO ==========
     elif estado_atual == "AGUARDANDO_RESERVA":
         try:
+            # Validação básica do formato
+            if '-' not in mensagem or 'para' not in mensagem:
+                raise ValueError("Formato inválido")
+                
             partes = mensagem.split('-')
             origem_destino = partes[0].replace('RESERVA', '').strip()
             pessoas = int(partes[1].replace('pessoas', '').strip())
@@ -242,10 +271,10 @@ def webhook():
                 "Cliente": telefone,
                 "Data": data_reserva,
                 "Hora_Coleta": "08:00",
-                "ID_Local_Origem": "LOC_005",
-                "ID_Local_Destino": "LOC_001",
+                "ID_Local_Origem": "LOC_005",  # Aeroporto GRU
+                "ID_Local_Destino": "LOC_001",  # Meliá Campinas
                 "Categoria_Veiculo": veiculo,
-                "ID_Motorista": "MOT_001",
+                "ID_Motorista": "MOT_001",  # Alencar
                 "Status": "Confirmado",
                 "Valor": valor
             }
@@ -283,6 +312,7 @@ def webhook():
         except Exception as e:
             msg.body(f"❌ Erro ao processar reserva. Formato correto:\n"
                      "RESERVA [origem] para [destino] - [número] pessoas - [data]\n\n"
+                     f"Exemplo: RESERVA GRU para Campinas - 4 pessoas - 20/07/2025\n\n"
                      f"Erro técnico: {str(e)}")
         
         estado_usuario["estado"] = "INICIO"
@@ -291,6 +321,11 @@ def webhook():
     # ========== CONSULTA DE STATUS INTEGRADA ==========
     elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
         try:
+            # Validação básica do formato do ID
+            if not mensagem.startswith("RES_"):
+                msg.body("❌ Formato de reserva inválido! Deve começar com RES_")
+                return str(resp)
+                
             reserva = buscar_na_planilha("Reservas_JCM", "ID_Reserva", mensagem)
             
             if reserva:
@@ -323,19 +358,19 @@ def webhook():
         ESTADOS[telefone] = estado_usuario
     
     elif estado_atual == "AGUARDANDO_CANCELAMENTO":
-        if mensagem.isdigit():
+        if mensagem.startswith("RES_") and len(mensagem) > 4:
             msg.body(f"✅ Reserva #{mensagem} cancelada com sucesso!\nValor será estornado em até 5 dias úteis.")
         else:
-            msg.body("❌ Número inválido. Digite apenas números (ex: 175)")
+            msg.body("❌ Número inválido. Digite o ID completo da reserva (ex: RES_123456)")
         
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
     
     elif estado_atual == "AGUARDANDO_PAGAMENTO":
-        if mensagem.isdigit():
+        if mensagem.startswith("RES_"):
             msg.body(f"💳 Pagamento para reserva #{mensagem}:\n🔗 Link: https://jcmviagens.com/pagar?id={mensagem}\n\nValidade: 24 horas")
         else:
-            msg.body("⚠️ Digite apenas o número da reserva para pagamento")
+            msg.body("⚠️ Digite o número completo da reserva para pagamento (ex: RES_123456)")
         
         estado_usuario["estado"] = "INICIO"
         ESTADOS[telefone] = estado_usuario
@@ -365,6 +400,19 @@ def teste_sheets():
             return "❌ Falha na conexão com Google Sheets"
     except Exception as e:
         return f"ERRO: {str(e)}"
+
+# ========== ROTA DE DIAGNÓSTICO DE CREDENCIAIS ==========
+@app.route('/check-creds')
+def check_creds():
+    if not GOOGLE_CREDS:
+        return "Credenciais não carregadas!"
+    
+    try:
+        # Verificar se a chave privada é válida
+        signer = RSASigner.from_string(GOOGLE_CREDS['private_key'].replace('\\n', '\n'))
+        return "✅ Chave privada válida!"
+    except Exception as e:
+        return f"❌ Erro na chave privada: {str(e)}"
 
 # ========== WARMUP ==========
 @app.route('/warmup')
