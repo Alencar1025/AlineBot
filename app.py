@@ -13,6 +13,7 @@ import logging
 from functools import lru_cache
 import hashlib
 import time
+import json  # Adicionado para processar o JSON
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
 app = Flask(__name__)
@@ -28,18 +29,19 @@ twilio_auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
 
 # ========== CONFIGURAÇÃO GOOGLE SHEETS ATUALIZADA ==========
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-GOOGLE_CREDS = {
-    "type": "service_account",
-    "project_id": os.environ.get('GCP_PROJECT_ID'),
-    "private_key_id": os.environ.get('GCP_PRIVATE_KEY_ID'),
-    "private_key": os.environ.get('GCP_PRIVATE_KEY').replace('\\n', '\n'),
-    "client_email": os.environ.get('GCP_CLIENT_EMAIL'),
-    "client_id": os.environ.get('GCP_CLIENT_ID'),
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": os.environ.get('GCP_CERT_URL')
-}
+
+# Carregar credenciais do JSON único
+creds_json = os.environ.get('GOOGLE_CREDS_JSON')
+if creds_json:
+    try:
+        GOOGLE_CREDS = json.loads(creds_json)
+        print("✅ Credenciais Google carregadas com sucesso!")
+    except Exception as e:
+        print(f"❌ ERRO ao decodificar JSON: {str(e)}")
+        GOOGLE_CREDS = {}
+else:
+    print("⚠️ AVISO: GOOGLE_CREDS_JSON não encontrada!")
+    GOOGLE_CREDS = {}
 
 # ---------- SISTEMA DE INTENÇÕES ATUALIZADO ----------
 INTENTOES = {
@@ -83,6 +85,10 @@ def detectar_intencao(mensagem):
 
 def conectar_google_sheets():
     try:
+        if not GOOGLE_CREDS:
+            print("❌ Credenciais Google não disponíveis!")
+            return None
+            
         creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=SCOPES)
         return gspread.authorize(creds)
     except Exception as e:
@@ -94,6 +100,10 @@ def conectar_google_sheets():
 def buscar_na_planilha(nome_planilha, coluna_busca, valor_busca):
     try:
         gc = conectar_google_sheets()
+        if not gc:
+            print("❌ Conexão não estabelecida!")
+            return None
+            
         planilha = gc.open(nome_planilha).sheet1
         dados = planilha.get_all_records()
         
@@ -240,32 +250,35 @@ def webhook():
                 "Valor": valor
             }
             
-            # Salvar na planilha
+            # Salvar na planilha com verificação de conexão
             gc = conectar_google_sheets()
-            planilha_reservas = gc.open("Reservas_JCM").sheet1
-            planilha_reservas.append_row(list(reserva_data.values()))
-            
-            # Registrar pagamento
-            pagamento_data = {
-                "Reserva_ID": id_reserva,
-                "Motorista": "Alencar",
-                "Valor_Base": valor * 0.8,
-                "Valor_Espera": 0.00,
-                "Comissao_JCM": valor * 0.2,
-                "Ambiente": "Producao",
-                "Status": "Pendente"
-            }
-            planilha_pagamentos = gc.open("Pagamentos_Motoristas_JCM").sheet1
-            planilha_pagamentos.append_row(list(pagamento_data.values()))
-            
-            msg.body(f"✅ Reserva {id_reserva} confirmada!\n\n" 
-                     f"*Detalhes:*\n"
-                     f"- Origem: Aeroporto GRU\n"
-                     f"- Destino: Meliá Campinas\n"
-                     f"- Data: {data_reserva}\n"
-                     f"- Veículo: {veiculo}\n"
-                     f"- Valor: R$ {valor:.2f}\n\n"
-                     f"Pagamento motorista registrado ✅")
+            if gc:
+                planilha_reservas = gc.open("Reservas_JCM").sheet1
+                planilha_reservas.append_row(list(reserva_data.values()))
+                
+                # Registrar pagamento
+                pagamento_data = {
+                    "Reserva_ID": id_reserva,
+                    "Motorista": "Alencar",
+                    "Valor_Base": valor * 0.8,
+                    "Valor_Espera": 0.00,
+                    "Comissao_JCM": valor * 0.2,
+                    "Ambiente": "Producao",
+                    "Status": "Pendente"
+                }
+                planilha_pagamentos = gc.open("Pagamentos_Motoristas_JCM").sheet1
+                planilha_pagamentos.append_row(list(pagamento_data.values()))
+                
+                msg.body(f"✅ Reserva {id_reserva} confirmada!\n\n" 
+                         f"*Detalhes:*\n"
+                         f"- Origem: Aeroporto GRU\n"
+                         f"- Destino: Meliá Campinas\n"
+                         f"- Data: {data_reserva}\n"
+                         f"- Veículo: {veiculo}\n"
+                         f"- Valor: R$ {valor:.2f}\n\n"
+                         f"Pagamento motorista registrado ✅")
+            else:
+                msg.body("❌ Erro na conexão com o Google Sheets. Tente novamente mais tarde.")
             
         except Exception as e:
             msg.body(f"❌ Erro ao processar reserva. Formato correto:\n"
@@ -277,28 +290,33 @@ def webhook():
     
     # ========== CONSULTA DE STATUS INTEGRADA ==========
     elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
-        reserva = buscar_na_planilha("Reservas_JCM", "ID_Reserva", mensagem)
-        
-        if reserva:
-            motorista = buscar_na_planilha("Motoristas_JCM", "ID_Contato", reserva["ID_Motorista"])
-            nome_motorista = motorista["Nome"] if motorista else "Não atribuído"
+        try:
+            reserva = buscar_na_planilha("Reservas_JCM", "ID_Reserva", mensagem)
             
-            origem = buscar_na_planilha("Locais_Especificos_JCM", "ID_Local", reserva["ID_Local_Origem"])
-            destino = buscar_na_planilha("Locais_Especificos_JCM", "ID_Local", reserva["ID_Local_Destino"])
-            
-            nome_origem = origem["Nome"] if origem else "Desconhecido"
-            nome_destino = destino["Nome"] if destino else "Desconhecido"
-            
-            resposta = (f"✅ Reserva *{mensagem}*\n"
-                        f"Status: {reserva['Status']}\n"
-                        f"Data: {reserva['Data']}\n"
-                        f"Origem: {nome_origem}\n"
-                        f"Destino: {nome_destino}\n"
-                        f"Veículo: {reserva['Categoria_Veiculo']}\n"
-                        f"Motorista: {nome_motorista}\n"
-                        f"Valor: R$ {reserva['Valor']:.2f}")
-        else:
-            resposta = "❌ Reserva não encontrada. Verifique o número."
+            if reserva:
+                # Buscar motorista associado
+                motorista = buscar_na_planilha("Motoristas_JCM", "ID_Contato", reserva["ID_Motorista"])
+                nome_motorista = motorista["Nome"] if motorista else "Não atribuído"
+                
+                # Buscar origem/destino
+                origem = buscar_na_planilha("Locais_Especificos_JCM", "ID_Local", reserva["ID_Local_Origem"])
+                destino = buscar_na_planilha("Locais_Especificos_JCM", "ID_Local", reserva["ID_Local_Destino"])
+                
+                nome_origem = origem["Nome"] if origem else "Desconhecido"
+                nome_destino = destino["Nome"] if destino else "Desconhecido"
+                
+                resposta = (f"✅ Reserva *{mensagem}*\n"
+                            f"Status: {reserva['Status']}\n"
+                            f"Data: {reserva['Data']}\n"
+                            f"Origem: {nome_origem}\n"
+                            f"Destino: {nome_destino}\n"
+                            f"Veículo: {reserva['Categoria_Veiculo']}\n"
+                            f"Motorista: {nome_motorista}\n"
+                            f"Valor: R$ {reserva['Valor']:.2f}")
+            else:
+                resposta = "❌ Reserva não encontrada. Verifique o número."
+        except Exception as e:
+            resposta = f"❌ Erro ao buscar reserva: {str(e)}"
         
         msg.body(resposta)
         estado_usuario["estado"] = "INICIO"
@@ -339,9 +357,12 @@ def webhook():
 def teste_sheets():
     try:
         gc = conectar_google_sheets()
-        planilha = gc.open("Reservas_JCM").sheet1
-        primeira_linha = planilha.row_values(1)
-        return f"Conexão OK! Cabeçalhos: {primeira_linha}"
+        if gc:
+            planilha = gc.open("Reservas_JCM").sheet1
+            primeira_linha = planilha.row_values(1)
+            return f"Conexão OK! Cabeçalhos: {primeira_linha}"
+        else:
+            return "❌ Falha na conexão com Google Sheets"
     except Exception as e:
         return f"ERRO: {str(e)}"
 
