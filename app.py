@@ -1,5 +1,5 @@
 # ---------- IMPORTS OBRIGATÓRIOS ----------
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 import re
 import os
@@ -11,7 +11,6 @@ import time
 import requests
 import logging
 from functools import lru_cache
-import time
 import json
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
@@ -88,13 +87,27 @@ def conectar_google_sheets():
             print("❌ Credenciais Google não disponíveis!")
             return None
             
-        # Corrigir as quebras de linha na chave privada
-        fixed_creds = GOOGLE_CREDS.copy()
-        if 'private_key' in fixed_creds:
-            # Remover todas as barras extras e formatar corretamente
-            fixed_creds['private_key'] = fixed_creds['private_key'].replace('\\\\n', '\n').replace('\\n', '\n')
-            
-        creds = Credentials.from_service_account_info(fixed_creds, scopes=SCOPES)
+        # Extrair e formatar a chave privada corretamente
+        private_key = GOOGLE_CREDS.get('private_key', '')
+        private_key = private_key.replace('\\\\n', '\n')  # Para ambientes Windows/Linux
+        private_key = private_key.replace('\\n', '\n')     # Para ambientes Render/Cloud
+        
+        # Criar credenciais com a chave formatada
+        creds_info = {
+            "type": GOOGLE_CREDS["type"],
+            "project_id": GOOGLE_CREDS["project_id"],
+            "private_key_id": GOOGLE_CREDS["private_key_id"],
+            "private_key": private_key,
+            "client_email": GOOGLE_CREDS["client_email"],
+            "client_id": GOOGLE_CREDS["client_id"],
+            "auth_uri": GOOGLE_CREDS["auth_uri"],
+            "token_uri": GOOGLE_CREDS["token_uri"],
+            "auth_provider_x509_cert_url": GOOGLE_CREDS["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": GOOGLE_CREDS["client_x509_cert_url"],
+            "universe_domain": GOOGLE_CREDS.get("universe_domain", "googleapis.com")
+        }
+        
+        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         return gspread.authorize(creds)
     except Exception as e:
         print(f"ERRO CONEXÃO GOOGLE: {str(e)}")
@@ -445,6 +458,28 @@ def teste_sheets():
             return "❌ Falha na conexão com Google Sheets"
     except Exception as e:
         return f"ERRO: {str(e)}"
+
+# ========== ROTA DE DIAGNÓSTICO DE CREDENCIAIS ==========
+@app.route('/debug-creds')
+def debug_creds():
+    if not GOOGLE_CREDS:
+        return jsonify({"status": "error", "message": "Credenciais não carregadas"})
+    
+    try:
+        # Verificar informações básicas
+        debug_info = {
+            "status": "success",
+            "client_email": GOOGLE_CREDS.get("client_email", ""),
+            "private_key_length": len(GOOGLE_CREDS.get("private_key", "")),
+            "private_key_start": GOOGLE_CREDS.get("private_key", "")[:30],
+            "private_key_end": GOOGLE_CREDS.get("private_key", "")[-30:],
+            "contains_newline": "\n" in GOOGLE_CREDS.get("private_key", ""),
+            "is_valid_format": "-----BEGIN PRIVATE KEY-----" in GOOGLE_CREDS.get("private_key", "")
+        }
+        
+        return jsonify(debug_info)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
 
 # ========== WARMUP ==========
 @app.route('/warmup')
