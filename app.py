@@ -1,5 +1,6 @@
 # ---------- IMPORTS OBRIGATÓRIOS ----------
 from flask import Flask, request, jsonify, g
+from twilio.twiml.messaging_response import MessagingResponse
 import re
 import os
 import sqlite3
@@ -10,7 +11,6 @@ import time
 import requests
 import logging
 import json
-import messagebird  # Novo provider
 
 # ---------- CONFIGURAÇÕES INICIAIS ----------
 app = Flask(__name__)
@@ -27,10 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('AlineBot')
 
-# Configuração MessageBird
-MBIRD_API_KEY = os.environ.get('MBIRD_API_KEY')
-MBIRD_NUMBER = os.environ.get('MBIRD_NUMBER')
-client = messagebird.Client(MBIRD_API_KEY) if MBIRD_API_KEY else None
+# Autenticação Twilio
+twilio_account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
+twilio_auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
 
 # Configuração Google Sheets
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -73,7 +72,8 @@ INTENTOES = {
     "pagar": ["pagar", "pagamento", "pague", "comprar"],
     "status": ["status", "situação", "verificar", "consulta"],
     "cancelar": ["cancelar", "desmarcar", "anular", "remover"],
-    "suporte": ["suporte", "atendente", "humano", "operador"]
+    "suporte": ["suporte", "atendente", "humano", "operador"],
+    "continuar": ["continuar", "seguir", "voltar", "retomar"]
 }
 
 # ---------- FUNÇÕES AUXILIARES ----------
@@ -108,36 +108,14 @@ def conectar_google_sheets():
         logger.error(f"Erro Google Sheets: {str(e)}")
         return None
 
-def enviar_resposta(telefone, mensagem):
-    """Envia mensagem via MessageBird"""
-    try:
-        if client:
-            msg = client.message_create(
-                MBIRD_NUMBER,
-                f"+55{telefone}",  # Formato internacional para Brasil
-                mensagem
-            )
-            logger.info(f"Mensagem enviada para {telefone}: {mensagem[:50]}...")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Erro MessageBird: {str(e)}")
-        return False
-
 # ---------- ROTA PRINCIPAL ----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json()
-    logger.info(f"Dados recebidos: {json.dumps(data, indent=2)}")
+    from_number = request.values.get('From', '')
+    mensagem = request.values.get('Body', '').strip()
+    logger.info(f"Mensagem recebida de {from_number}: {mensagem}")
     
-    # Extrair informações do MessageBird
-    if data.get('type') == 'message':
-        telefone = data['source']['number']
-        mensagem = data['content']['text']
-    else:
-        return jsonify({"status": "ignorado"}), 200
-    
-    telefone = re.sub(r'\D', '', telefone)[-11:]  # Normalizar telefone
+    telefone = re.sub(r'\D', '', from_number)[-11:]  # Normalizar telefone
     
     db = get_db()
     cursor = db.cursor()
@@ -159,23 +137,24 @@ def webhook():
         primeira_vez = estado_usuario["primeira_vez"]
     
     # Processar mensagem
-    intencao = detectar_intencao(mensagem)
-    resposta = processar_mensagem(estado_atual, intencao, mensagem, telefone, primeira_vez)
+    resp = MessagingResponse()
+    msg = resp.message()
+    resultado = processar_mensagem(estado_atual, mensagem, telefone, primeira_vez)
     
     # Atualizar estado
-    novo_estado = resposta.get("novo_estado", estado_atual)
+    novo_estado = resultado.get("novo_estado", estado_atual)
     cursor.execute(
         "UPDATE user_states SET state = ?, last_interaction = ?, primeira_vez = ? WHERE phone = ?",
         (novo_estado, datetime.now().isoformat(), False, telefone)
     )
     db.commit()
     
-    # Enviar resposta
-    enviar_resposta(telefone, resposta["mensagem"])
-    return jsonify({"status": "sucesso"}), 200
+    msg.body(resultado["mensagem"])
+    return str(resp)
 
-def processar_mensagem(estado_atual, intencao, mensagem, telefone, primeira_vez):
+def processar_mensagem(estado_atual, mensagem, telefone, primeira_vez):
     periodo = obter_periodo_dia()
+    intencao = detectar_intencao(mensagem)
     resposta = {"mensagem": "", "novo_estado": estado_atual}
     
     if estado_atual == "INICIO":
@@ -211,7 +190,24 @@ def processar_mensagem(estado_atual, intencao, mensagem, telefone, primeira_vez)
             )
             resposta["novo_estado"] = "AGUARDANDO_RESERVA"
         
-        # Outros estados (similar ao anterior, adaptado para novo fluxo)
+        elif intencao == "pagar":
+            resposta["mensagem"] = "💳 Link para pagamento: https://jcmviagens.com/pagar\n\nEnvie o número da reserva para pagamento específico"
+            resposta["novo_estado"] = "AGUARDANDO_PAGAMENTO"
+        
+        elif intencao == "status":
+            resposta["mensagem"] = "🔍 Digite o número completo da reserva (ex: RES_123456) para verificar o status:"
+            resposta["novo_estado"] = "AGUARDANDO_NUMERO_RESERVA"
+        
+        elif intencao == "cancelar":
+            resposta["mensagem"] = "❌ Digite o número completo da reserva que deseja cancelar (ex: RES_123456):"
+            resposta["novo_estado"] = "AGUARDANDO_CANCELAMENTO"
+        
+        elif intencao == "suporte":
+            resposta["mensagem"] = "⏳ Redirecionando para atendente humano..."
+            resposta["novo_estado"] = "SUPORTE_ATIVO"
+        
+        else:
+            resposta["mensagem"] = "⚠️ Opção não reconhecida. Digite *AJUDA* para ver opções"
     
     elif estado_atual == "AGUARDANDO_RESERVA":
         # Regex robusto que aceita variações
@@ -224,8 +220,55 @@ def processar_mensagem(estado_atual, intencao, mensagem, telefone, primeira_vez)
             pessoas = int(match.group(3))
             data_reserva = match.group(4)
             
-            # Processar reserva (similar ao código anterior)
-            resposta["mensagem"] = f"✅ Reserva confirmada! Detalhes:\n- Origem: {origem}\n- Destino: {destino}\n- Data: {data_reserva}"
+            # Determinar veículo e valor
+            if pessoas <= 4:
+                veiculo = "Sedan"
+                valor = 600.00
+            elif pessoas <= 7:
+                veiculo = "SUV"
+                valor = 750.00
+            else:
+                veiculo = "Van"
+                valor = 900.00
+            
+            id_reserva = f"RES_{int(time.time())}"
+            
+            # Salvar na planilha
+            gc = conectar_google_sheets()
+            if gc:
+                try:
+                    planilha_reservas = gc.open("Reservas_JCM").sheet1
+                    reserva_data = [
+                        id_reserva, telefone, data_reserva, "08:00", 
+                        "LOC_005", "LOC_001", veiculo, "MOT_001", 
+                        "Confirmado", valor
+                    ]
+                    planilha_reservas.append_row(reserva_data)
+                    
+                    # Registrar pagamento
+                    planilha_pagamentos = gc.open("Pagamentos_Motoristas_JCM").sheet1
+                    pagamento_data = [
+                        id_reserva, "Alencar", valor * 0.8, 0.00,
+                        valor * 0.2, "Producao", "Pendente"
+                    ]
+                    planilha_pagamentos.append_row(pagamento_data)
+                    
+                    resposta["mensagem"] = (
+                        f"✅ Reserva {id_reserva} confirmada!\n\n" 
+                        f"*Detalhes:*\n"
+                        f"- Origem: {origem}\n"
+                        f"- Destino: {destino}\n"
+                        f"- Data: {data_reserva}\n"
+                        f"- Veículo: {veiculo}\n"
+                        f"- Valor: R$ {valor:.2f}\n\n"
+                        f"Pagamento motorista registrado ✅"
+                    )
+                except Exception as e:
+                    logger.error(f"Erro ao salvar reserva: {str(e)}")
+                    resposta["mensagem"] = "❌ Erro interno ao processar reserva. Tente novamente mais tarde."
+            else:
+                resposta["mensagem"] = "❌ Erro na conexão com o Google Sheets. Tente novamente mais tarde."
+            
             resposta["novo_estado"] = "INICIO"
         else:
             resposta["mensagem"] = (
@@ -236,10 +279,131 @@ def processar_mensagem(estado_atual, intencao, mensagem, telefone, primeira_vez)
                 "reserva São Paulo para Rio - 2 pessoas - 30/07/2025"
             )
     
+    elif estado_atual == "AGUARDANDO_NUMERO_RESERVA":
+        try:
+            # Normalizar o ID da reserva
+            reserva_id = mensagem.strip().upper()
+            if not reserva_id.startswith("RES_"):
+                reserva_id = "RES_" + reserva_id
+            
+            gc = conectar_google_sheets()
+            if gc:
+                planilha = gc.open("Reservas_JCM").sheet1
+                dados = planilha.get_all_records()
+                
+                reserva = None
+                for linha in dados:
+                    if str(linha["ID_Reserva"]).strip() == reserva_id:
+                        reserva = linha
+                        break
+                
+                if reserva:
+                    # Buscar motorista
+                    planilha_motoristas = gc.open("Motoristas_JCM").sheet1
+                    motoristas = planilha_motoristas.get_all_records()
+                    motorista = next((m for m in motoristas if m["ID_Contato"] == reserva["ID_Motorista"]), None)
+                    
+                    # Buscar locais
+                    planilha_locais = gc.open("Locais_Especificos_JCM").sheet1
+                    locais = planilha_locais.get_all_records()
+                    origem = next((l for l in locais if l["ID_Local"] == reserva["ID_Local_Origem"]), None)
+                    destino = next((l for l in locais if l["ID_Local"] == reserva["ID_Local_Destino"]), None)
+                    
+                    resposta["mensagem"] = (
+                        f"✅ Reserva *{reserva_id}*\n"
+                        f"Status: {reserva['Status']}\n"
+                        f"Data: {reserva['Data']}\n"
+                        f"Origem: {origem['Nome'] if origem else 'Desconhecido'}\n"
+                        f"Destino: {destino['Nome'] if destino else 'Desconhecido'}\n"
+                        f"Veículo: {reserva['Categoria_Veiculo']}\n"
+                        f"Motorista: {motorista['Nome'] if motorista else 'Não atribuído'}\n"
+                        f"Valor: R$ {reserva['Valor']:.2f}"
+                    )
+                else:
+                    resposta["mensagem"] = f"❌ Reserva {reserva_id} não encontrada. Verifique o número."
+            else:
+                resposta["mensagem"] = "❌ Falha na conexão com Google Sheets"
+        except Exception as e:
+            resposta["mensagem"] = f"❌ Erro ao buscar reserva: {str(e)}"
+        
+        resposta["novo_estado"] = "INICIO"
+    
+    elif estado_atual == "AGUARDANDO_CANCELAMENTO":
+        # Normalizar o ID da reserva
+        reserva_id = mensagem.strip().upper()
+        if not reserva_id.startswith("RES_"):
+            reserva_id = "RES_" + reserva_id
+        
+        if len(reserva_id) > 4:
+            resposta["mensagem"] = f"✅ Reserva #{reserva_id} cancelada com sucesso!\nValor será estornado em até 5 dias úteis."
+        else:
+            resposta["mensagem"] = "❌ Número inválido. Digite o ID completo da reserva (ex: RES_123456)"
+        
+        resposta["novo_estado"] = "INICIO"
+    
+    elif estado_atual == "AGUARDANDO_PAGAMENTO":
+        # Normalizar o ID da reserva
+        reserva_id = mensagem.strip().upper()
+        if not reserva_id.startswith("RES_"):
+            reserva_id = "RES_" + reserva_id
+        
+        if len(reserva_id) > 4:
+            resposta["mensagem"] = f"💳 Pagamento para reserva #{reserva_id}:\n🔗 Link: https://jcmviagens.com/pagar?id={reserva_id}\n\nValidade: 24 horas"
+        else:
+            resposta["mensagem"] = "⚠️ Digite o número completo da reserva para pagamento (ex: RES_123456)"
+        
+        resposta["novo_estado"] = "INICIO"
+    
+    elif estado_atual == "SUPORTE_ATIVO":
+        resposta["mensagem"] = "⌛ Um atendente humano já foi notificado e entrará em contato em breve!"
+        resposta["novo_estado"] = "INICIO"
+    
+    else:
+        resposta["mensagem"] = "🔄 Reiniciando conversa... Digite *OI* para começar"
+        resposta["novo_estado"] = "INICIO"
+    
     return resposta
 
-# ... (rotas de teste, warmup, etc) ...
+# ========== ROTA DE TESTE DE PLANILHAS ==========
+@app.route('/teste-sheets')
+def teste_sheets():
+    try:
+        gc = conectar_google_sheets()
+        if gc:
+            planilha = gc.open("Reservas_JCM").sheet1
+            primeira_linha = planilha.row_values(1)
+            return f"Conexão OK! Cabeçalhos: {primeira_linha}"
+        else:
+            return "❌ Falha na conexão com Google Sheets"
+    except Exception as e:
+        return f"ERRO: {str(e)}"
 
+# ========== ROTA DE DIAGNÓSTICO ==========
+@app.route('/system-status')
+def system_status():
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT COUNT(*) FROM user_states")
+    user_count = cursor.fetchone()[0]
+    
+    return jsonify({
+        "status": "operacional",
+        "users": user_count,
+        "twilio_configured": bool(twilio_account_sid and twilio_auth_token),
+        "google_configured": bool(GOOGLE_CREDS)
+    })
+
+# ========== WARMUP ==========
+@app.route('/warmup')
+def warmup():
+    return "Instance warmed up!", 200
+
+# ========== HEALTH CHECK ==========
+@app.route('/healthz')
+def health_check():
+    return "✅ AlineBot Online", 200
+
+# ---------- INICIAR SERVIDOR ----------
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get("PORT", 5000))
