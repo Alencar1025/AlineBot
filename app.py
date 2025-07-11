@@ -102,27 +102,32 @@ def mapear_planilhas():
     try:
         drive_service = build('drive', 'v3', credentials=creds)
         
-        # Mapear subpastas
+        # Mapear subpastas - versão resiliente a maiúsculas/minúsculas
         pastas = {
-            'base': '1_Dados_base',
-            'transacoes': '2_Transacoes',
-            'financeiro': '3_Financeiro'
+            'base': ['1_Dados_Base', '1_dados_base', '1_Dados_base'],  # Variações de nome
+            'transacoes': ['2_Transacoes', '2_transacoes'],
+            'financeiro': ['3_Financeiro', '3_financeiro']
         }
         
         # Obter ID da pasta raiz
         if not PASTA_RAIZ_ID:
-            logger.error("Variável PASTA_RAIZ_ID não configurada!")
+            logger.critical("Variável PASTA_RAIZ_ID não configurada!")
             return False
         
         # Encontrar subpastas
         subpasta_ids = {}
-        for tipo, nome in pastas.items():
-            query = f"name='{nome}' and '{PASTA_RAIZ_ID}' in parents and mimeType='application/vnd.google-apps.folder'"
-            results = drive_service.files().list(q=query, fields="files(id)").execute()
-            if not results.get('files'):
-                logger.error(f"Subpasta '{nome}' não encontrada!")
-                continue
-            subpasta_ids[tipo] = results['files'][0]['id']
+        for tipo, nomes in pastas.items():
+            encontrou = False
+            for nome in nomes:
+                query = f"name='{nome}' and '{PASTA_RAIZ_ID}' in parents and mimeType='application/vnd.google-apps.folder'"
+                results = drive_service.files().list(q=query, fields="files(id)").execute()
+                if results.get('files'):
+                    subpasta_ids[tipo] = results['files'][0]['id']
+                    logger.info(f"Subpasta encontrada: {nome} -> ID: {subpasta_ids[tipo]}")
+                    encontrou = True
+                    break
+            if not encontrou:
+                logger.error(f"Nenhuma subpasta encontrada para {tipo} com nomes: {nomes}")
         
         # Mapear planilhas em cada subpasta
         if subpasta_ids.get('base'):
@@ -193,7 +198,7 @@ def formatar_resposta(reserva):
 # ========== ROTAS PRINCIPAIS ==========
 @app.route("/")
 def home():
-    return "AlineBot JCM Operacional - v3.0 (11/07/2025)"
+    return "AlineBot JCM Operacional - v3.2 (11/07/2025)"
 
 @app.route("/teste-sheets")
 def teste_sheets():
@@ -229,6 +234,23 @@ def map_sheets():
         "planilhas": PLANILHAS,
         "pasta_raiz": PASTA_RAIZ_ID
     })
+
+@app.route("/debug-folders")
+def debug_folders():
+    try:
+        creds = conectar_google_sheets()
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        # Listar todas pastas na raiz
+        query = f"'{PASTA_RAIZ_ID}' in parents and mimeType='application/vnd.google-apps.folder'"
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        
+        return jsonify({
+            "status": "success",
+            "folders": results.get('files', [])
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
