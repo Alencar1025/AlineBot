@@ -104,8 +104,14 @@ def mapear_planilhas():
         
         # Mapear subpastas - versão resiliente a maiúsculas/minúsculas
         pastas = {
-            'base': ['1_Dados_Base', '1_dados_base', '1_Dados_base'],  # Variações de nome
-            'transacoes': ['2_Transacoes', '2_transacoes'],
+            'base': ['1_Dados_Base', '1_dados_base', '1_Dados_base'],
+            'transacoes': [
+                '2_Transacoes',
+                '2_transacoes',
+                '2 Transações',   # Variação com espaço que você encontrou
+                '2_Transações',
+                '2-Transacoes'
+            ],
             'financeiro': ['3_Financeiro', '3_financeiro']
         }
         
@@ -198,7 +204,12 @@ def formatar_resposta(reserva):
 # ========== ROTAS PRINCIPAIS ==========
 @app.route("/")
 def home():
-    return "AlineBot JCM Operacional - v3.2 (11/07/2025)"
+    return "AlineBot JCM Operacional - v3.3 (11/07/2025)"
+
+# Rota de health check para o Render
+@app.route('/healthz')
+def health_check():
+    return 'OK', 200
 
 @app.route("/teste-sheets")
 def teste_sheets():
