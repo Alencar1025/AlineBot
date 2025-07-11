@@ -1,16 +1,14 @@
 import os
 import logging
-import csv
 import re
+import json
 from datetime import datetime
 from flask import Flask, request, jsonify
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-import json
+from googleapiclient.errors import HttpError
 
 app = Flask(__name__)
 
@@ -25,15 +23,27 @@ TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Configuração do Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SERVICE_ACCOUNT_FILE = json.loads(os.environ.get('GOOGLE_CREDENTIALS_JSON'))
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+SERVICE_ACCOUNT_FILE = json.loads(os.environ.get('GOOGLE_CREDS_JSON'))
+PASTA_RAIZ_ID = os.environ.get('PASTA_RAIZ_ID')  # ID da pasta JCM_OPERACIONAL
 
 # Estado da conversa por usuário
 estado_usuario = {}
 contexto_reserva = {}
 primeira_interacao = {}
 
-# ========== SISTEMA DE INTENÇÕES ATUALIZADO (11/07/2025) ==========
+# Mapeamento global de planilhas
+PLANILHAS = {
+    'clientes': None,
+    'motoristas': None,
+    'reservas': None,
+    'pagamentos': None
+}
+
+# ========== SISTEMA DE INTENÇÕES ATUALIZADO ==========
 INTENTOES = {
     "saudacao": ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "aline", "alô", "oi!", "ola!", "olá!", "ei", "e aí", "hello", "hi"],
     "ajuda": ["ajuda", "socorro", "opções", "comandos", "menu", "help", "ajude", "socorro!", "sos"],
@@ -49,7 +59,7 @@ INTENTOES = {
 def detectar_intencao(mensagem):
     mensagem = mensagem.lower().strip()
     
-    # 1. Verificar saudações compostas (ex: "bom dia")
+    # 1. Verificar saudações compostas
     for saudacao_composta in ["bom dia", "boa tarde", "boa noite"]:
         if saudacao_composta in mensagem:
             return "saudacao"
@@ -72,12 +82,81 @@ def detectar_intencao(mensagem):
 # ========== CONEXÃO COM GOOGLE SHEETS ==========
 def conectar_google_sheets():
     try:
-        creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        service = build('sheets', 'v4', credentials=creds)
-        return service
+        creds = service_account.Credentials.from_service_account_info(
+            SERVICE_ACCOUNT_FILE, 
+            scopes=SCOPES
+        )
+        return creds
     except Exception as e:
         logger.error(f"Erro na conexão com Google Sheets: {str(e)}")
         return None
+
+# ========== MAPEAR PLANILHAS ==========
+def mapear_planilhas():
+    global PLANILHAS
+    
+    creds = conectar_google_sheets()
+    if not creds:
+        return False
+    
+    try:
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        # Mapear subpastas
+        pastas = {
+            'base': '1_Dados_base',
+            'transacoes': '2_Transacoes',
+            'financeiro': '3_Financeiro'
+        }
+        
+        # Obter ID da pasta raiz
+        if not PASTA_RAIZ_ID:
+            logger.error("Variável PASTA_RAIZ_ID não configurada!")
+            return False
+        
+        # Encontrar subpastas
+        subpasta_ids = {}
+        for tipo, nome in pastas.items():
+            query = f"name='{nome}' and '{PASTA_RAIZ_ID}' in parents and mimeType='application/vnd.google-apps.folder'"
+            results = drive_service.files().list(q=query, fields="files(id)").execute()
+            if not results.get('files'):
+                logger.error(f"Subpasta '{nome}' não encontrada!")
+                continue
+            subpasta_ids[tipo] = results['files'][0]['id']
+        
+        # Mapear planilhas em cada subpasta
+        if subpasta_ids.get('base'):
+            query = f"'{subpasta_ids['base']}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
+            results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+            for file in results.get('files', []):
+                if 'Clientes_Especiais_JCM' in file['name']:
+                    PLANILHAS['clientes'] = file['id']
+                elif 'Motoristas_JCM' in file['name']:
+                    PLANILHAS['motoristas'] = file['id']
+        
+        if subpasta_ids.get('transacoes'):
+            query = f"'{subpasta_ids['transacoes']}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
+            results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+            for file in results.get('files', []):
+                if 'Reservas_JCM' in file['name']:
+                    PLANILHAS['reservas'] = file['id']
+        
+        if subpasta_ids.get('financeiro'):
+            query = f"'{subpasta_ids['financeiro']}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
+            results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+            for file in results.get('files', []):
+                if 'Pagamentos_Motoristas_JCM' in file['name']:
+                    PLANILHAS['pagamentos'] = file['id']
+        
+        logger.info(f"Planilhas mapeadas: {PLANILHAS}")
+        return True
+        
+    except HttpError as e:
+        logger.error(f"Erro do Google Drive: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Erro geral no mapeamento: {str(e)}")
+        return False
 
 # ========== FUNÇÕES AUXILIARES ==========
 def extrair_dados_reserva(mensagem):
@@ -114,19 +193,19 @@ def formatar_resposta(reserva):
 # ========== ROTAS PRINCIPAIS ==========
 @app.route("/")
 def home():
-    return "AlineBot JCM Operacional - v2.1 (11/07/2025)"
+    return "AlineBot JCM Operacional - v3.0 (11/07/2025)"
 
 @app.route("/teste-sheets")
 def teste_sheets():
-    service = conectar_google_sheets()
-    if not service:
-        return "❌ Falha na conexão com Google Sheets", 500
+    if not PLANILHAS['reservas']:
+        return "❌ Planilha de reservas não mapeada", 500
     
     try:
-        sheet = service.spreadsheets()
-        result = sheet.values().get(
-            spreadsheetId=os.environ.get('SPREADSHEET_ID'),
-            range="Reservas_JCM!A1:A1"
+        creds = conectar_google_sheets()
+        service = build('sheets', 'v4', credentials=creds)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=PLANILHAS['reservas'],
+            range="A1:A1"
         ).execute()
         return "✅ Conexão com Google Sheets bem-sucedida!"
     except Exception as e:
@@ -137,13 +216,19 @@ def debug_creds():
     if not SERVICE_ACCOUNT_FILE:
         return "❌ Credenciais não encontradas", 500
     
-    info = SERVICE_ACCOUNT_FILE
     debug_info = {
-        "client_email": info.get('client_email', 'Não encontrado'),
-        "private_key": f"{info.get('private_key', '')[0:50]}...[truncado]",
-        "private_key_length": len(info.get('private_key', ''))
+        "client_email": SERVICE_ACCOUNT_FILE.get('client_email', 'Não encontrado'),
+        "private_key_length": len(SERVICE_ACCOUNT_FILE.get('private_key', ''))
     }
     return jsonify(debug_info)
+
+@app.route("/map-sheets")
+def map_sheets():
+    return jsonify({
+        "status": "success",
+        "planilhas": PLANILHAS,
+        "pasta_raiz": PASTA_RAIZ_ID
+    })
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -212,7 +297,7 @@ def webhook():
                 "• *CANCELAR [ID]*: Cancelar reserva\n"
                 "• *SUPORTE*: Falar com atendente\n\n"
                 "Exemplos:\n"
-                "RESERMA Av. Paulista para Morumbi - 4 pessoas - 12/07 09:00\n"
+                "RESERVA Av. Paulista para Morumbi - 4 pessoas - 12/07 09:00\n"
                 "PAGAR RES_12345\n"
                 "STATUS RES_12345"
             )
@@ -254,6 +339,13 @@ def webhook():
     
     return str(resp)
 
+# Inicialização do sistema
 if __name__ == "__main__":
+    # Mapear planilhas ao iniciar o app
+    if mapear_planilhas():
+        logger.info("✅ Sistema inicializado com sucesso!")
+    else:
+        logger.error("❌ Falha ao mapear planilhas")
+    
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
