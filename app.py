@@ -3,12 +3,10 @@ import re
 import json
 import logging
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
@@ -22,11 +20,6 @@ TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# Configuração do Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SERVICE_ACCOUNT_FILE = json.loads(os.environ.get('GOOGLE_CREDS_JSON'))
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 
 # Estado da conversa por usuário
 estado_usuario = {}
@@ -317,8 +310,8 @@ def webhook():
                         f"⚠️ *PAGAMENTO PENDENTE!*\n\n"
                         f"ID Reserva: {reserva_id}\n"
                         f"Valor Entrada: R${entrada:.2f}\n\n"
-                        "Use: *PAGAR {reserva_id}*\n"
-                        "Exemplo: PAGAR {reserva_id}\n\n"
+                        f"Use: *PAGAR {reserva_id}*\n"
+                        f"Exemplo: PAGAR {reserva_id}\n\n"
                         "Ou digite *AJUDA* para ver todas opções."
                     )
                 else:
@@ -377,8 +370,8 @@ def webhook():
                 f"⚠️ *PAGAMENTO PENDENTE!*\n\n"
                 f"ID Reserva: {ultima_reserva}\n"
                 f"Valor Entrada: R${entrada:.2f}\n\n"
-                "Use o comando: *PAGAR {ultima_reserva}*\n\n"
-                "Exemplo: PAGAR {ultima_reserva}"
+                f"Use o comando: *PAGAR {ultima_reserva}*\n\n"
+                f"Exemplo: PAGAR {ultima_reserva}"
             )
         else:
             msg.body("❌ Nenhuma reserva pendente encontrada. Digite *RESERVA* para iniciar uma nova.")
@@ -402,7 +395,9 @@ def webhook():
 def home():
     return "AlineBot JCM - Sistema de Reservas Corporativas v5.0"
 
+# Endpoint de health check para compatibilidade com Render/Kubernetes
 @app.route("/health")
+@app.route("/healthz")
 def health_check():
     return "OK", 200
 
