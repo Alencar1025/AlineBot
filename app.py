@@ -169,6 +169,10 @@ def gerar_link_pagamento(reserva_id, valor):
     return f"https://jcm-pagamentos.com/pagar/{reserva_id}?valor={valor}"
 
 # ================= ROTA PRINCIPAL =================
+@app.route('/healthz', methods=['GET', 'HEAD'])
+def health_check():
+    return "OK", 200
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     telefone = request.form.get('From', '')
