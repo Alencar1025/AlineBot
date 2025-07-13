@@ -191,21 +191,32 @@ def registrar_reserva_google_sheets(dados):
     
     try:
         sheet = gc.open_by_key(SHEET_KEY).worksheet("Reservas_JCM")
+        
+        # Formatar data atual no padrão brasileiro
+        data_atual = datetime.now().strftime('%d/%m/%Y')
+        
+        # Extrair data e hora da reserva
+        data_hora = dados['data_hora'].split(' ')
+        data_reserva = data_hora[0] if len(data_hora) > 1 else data_atual
+        hora_reserva = data_hora[1] if len(data_hora) > 1 else "12:00"
+        
         nova_linha = [
             f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}",
             dados['cliente'],
-            datetime.now().strftime('%d/%m/%y'),
-            dados['hora_coleta'],
+            data_atual,  # Data do registro
+            hora_reserva,
             dados['origem'],
             dados['destino'],
             dados['categoria'],
-            "",  # ID_Motorista (preenchido posteriormente)
+            "",  # ID_Motorista
             "Pendente",
             dados['valor'],
             "Avulso",
             "Pendente",
             "", "", "", ""  # Campos restantes
         ]
+        
+        app.logger.info(f"Registrando reserva: {nova_linha}")
         sheet.append_row(nova_linha)
         return True
     except Exception as e:
@@ -286,11 +297,11 @@ def processar_reserva(mensagem, telefone, cliente):
         # Integração com Google Sheets
         if registrar_reserva_google_sheets({
             'cliente': cliente['nome'],
-            'hora_coleta': data_hora.split()[0] if ' ' in data_hora else data_hora,
             'origem': origem,
             'destino': destino,
             'categoria': "Sedan Executivo",  # Categoria padrão
-            'valor': "300.00"  # Valor estimado
+            'valor': "300.00",  # Valor estimado
+            'data_hora': data_hora.strip()
         }):
             # Atribui motorista e envia confirmação
             motorista = atribuir_motorista("")
@@ -437,13 +448,15 @@ def processar_mensagem(mensagem_lower, mensagem_original, telefone, cliente):
         return processar_reserva(mensagem_original, telefone, cliente)
     
     elif estado_atual == "CONFIRMACAO":
+        reserva = state_manager.reservas.get(telefone, {})
         state_manager.set_user_state(telefone, "INICIO")
+        
         return (f"✅ *Reserva confirmada!*\n\n"
                 f"Aqui estão os detalhes finais:\n"
-                f"• Origem: {state_manager.reservas[telefone]['origem']}\n"
-                f"• Destino: {state_manager.reservas[telefone]['destino']}\n"
-                f"• Data/Hora: {state_manager.reservas[telefone]['data_hora']}\n"
-                f"• Passageiros: {state_manager.reservas[telefone]['pessoas']}\n"
+                f"• Origem: {reserva.get('origem', 'N/A')}\n"
+                f"• Destino: {reserva.get('destino', 'N/A')}\n"
+                f"• Data/Hora: {reserva.get('data_hora', 'N/A')}\n"
+                f"• Passageiros: {reserva.get('pessoas', 'N/A')}\n"
                 f"• Motorista: CONT_00{random.randint(1,5)}\n\n"
                 f"📬 Enviamos um e-mail com todos os detalhes e comprovante.\n\n"
                 f"Obrigada por escolher a JCM Transportes! 🚗💨\n\n"
@@ -452,41 +465,9 @@ def processar_mensagem(mensagem_lower, mensagem_original, telefone, cliente):
     return ("🤔 Desculpe, não entendi bem.\n\n"
             "Digite *AJUDA* para ver as opções disponíveis ou *SUPORTE* para falar com nossa equipe.")
 
-# ================= FUNÇÕES DE TESTE =================
-def executar_testes():
-    """Função para executar testes automatizados"""
-    testes = [
-        ("Oi Aline, tudo bem?", True),
-        ("Bom dia, quero fazer uma reserva", True),
-        ("Reserva GRU para Hotel Tivoli - 2 pessoas - 15/07 14:30", True),
-        ("Reservar: Aeroporto Congonhas -> Morumbi, 3p, 16/07 09:00", True),
-        ("Preciso de um carro do aeroporto para o centro - 1 pessoa amanhã às 10h", True),
-        ("Quero reservar uma van saindo do shopping para o aeroporto com 4 passageiros dia 20/07 as 15h", True),
-        ("admin listar usuarios", True),
-        ("Como cancelar uma reserva?", True),
-        ("Obrigada!", True),
-    ]
-    
-    resultados = []
-    for mensagem, esperado in testes:
-        resultado = processar_mensagem(
-            mensagem.lower(), 
-            mensagem, 
-            "+5511988216292", 
-            {"nome": "Teste", "nivel": 5, "ativo": True}
-        )
-        sucesso = "✅" if not "não entendi" in resultado.lower() else "❌"
-        resultados.append(f"{sucesso} Teste: '{mensagem}'")
-    
-    return "\n".join(resultados)
-
 # ================= SERVIDOR PRODUÇÃO =================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    
-    # Executar testes na inicialização
-    app.logger.info("Executando testes de integração...")
-    app.logger.info(executar_testes())
     
     if os.environ.get('ENVIRONMENT') == 'production':
         from waitress import serve
