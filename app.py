@@ -43,6 +43,45 @@ def webhook():
     # Log detalhado
     app.logger.info(f"Mensagem recebida de {telefone}: {mensagem}")
     
+    try:
+        # Processar comandos administrativos (Alencar)
+        if mensagem.lower().startswith("admin ") or mensagem.lower().startswith("administrativo "):
+            resposta = processar_comando_admin(mensagem, telefone)
+            try:
+                client.messages.create(
+                    body=resposta,
+                    from_=f"whatsapp:{TWILIO_PHONE_NUMBER}",
+                    to=f"whatsapp:{telefone}"
+                )
+            except Exception as e:
+                app.logger.error(f"Erro ao enviar resposta administrativa: {str(e)}")
+            
+            # RESPOSTA OBRIGATÓRIA PARA O TWILIO
+            resp = MessagingResponse()
+            return str(resp)
+        
+        # ... (restante do código original) ...
+        
+        # VERIFICAÇÃO DE USUÁRIO ATIVO (ATUALIZADO)
+        if not cliente.get('ativo', False):
+            resp = MessagingResponse()
+            msg = resp.message()
+            msg.body("❌ Você não tem permissão para usar este sistema. Contate o administrador.")
+            return str(resp)
+        
+        # ... (restante do código) ...
+        
+        # RESPOSTA PADRÃO PARA CASOS NÃO TRATADOS
+        resp = MessagingResponse()
+        resp.message("🤖 Comando não reconhecido. Digite AJUDA para ver as opções.")
+        return str(resp)
+        
+    except Exception as e:
+        app.logger.error(f"ERRO CRÍTICO: {str(e)}")
+        resp = MessagingResponse()
+        resp.message("⚠️ Ocorreu um erro interno. Nossa equipe já foi notificada.")
+        return str(resp)
+    
     # ... [Restante do seu código existente] ...
 
 # ================= CONFIGURAÇÃO SERVIDOR PRODUÇÃO =================
