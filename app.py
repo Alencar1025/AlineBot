@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from oauth2client.service_account import ServiceAccountCredentials
+from dateutil.relativedelta import relativedelta
 
 # ================= CONFIGURAÇÃO INICIAL =================
 app = Flask(__name__)
@@ -185,6 +186,50 @@ def atribuir_motorista(mensagem):
         app.logger.error(f"Erro ao atribuir motorista: {str(e)}")
         return "❌ Falha na atribuição de motorista"
 
+def parse_data_relativa(data_str):
+    """Converte expressões como 'amanhã' em datas reais"""
+    hoje = datetime.now()
+    
+    if data_str.lower() in ['amanhã', 'amanha']:
+        return (hoje + relativedelta(days=1)).strftime('%d/%m/%y')
+    elif data_str.lower() == 'hoje':
+        return hoje.strftime('%d/%m/%y')
+    elif data_str.lower() == 'depois de amanhã':
+        return (hoje + relativedelta(days=2)).strftime('%d/%m/%y')
+    
+    return data_str
+
+def melhorar_entendimento_reserva(texto):
+    """Processamento NLP simplificado para entender formatos livres"""
+    # Normalização
+    texto = texto.lower().replace("seria", "").replace("gostaria", "").strip()
+    
+    # Extração de elementos chave
+    pessoas = re.search(r'(\d+)\s*(pessoas?|pax?|passageiros?)', texto)
+    data_hora = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4}).*?(\d{1,2}:\d{2})', texto) or \
+                re.search(r'(\d{1,2}/\d{1,2}).*?(\d{1,2}:\d{2})', texto) or \
+                re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', texto) or \
+                re.search(r'(\d{1,2}/\d{1,2})', texto)
+    
+    # Extração de origem e destino
+    locais = re.split(r'\s+(?:para|pro|pra|->|ate|até|em)\s+', texto, maxsplit=1)
+    
+    # Tratar datas relativas
+    data = None
+    hora = None
+    if data_hora:
+        data = parse_data_relativa(data_hora.group(1))
+        if data_hora.lastindex >= 2:
+            hora = data_hora.group(2)
+    
+    return {
+        'origem': locais[0].strip() if len(locais) > 0 else None,
+        'destino': locais[1].split(' ', 1)[0].strip() if len(locais) > 1 else None,
+        'pessoas': int(pessoas.group(1)) if pessoas else 1,
+        'data': data,
+        'hora': hora
+    }
+
 def registrar_reserva_google_sheets(dados):
     if not gc:
         return False
@@ -195,32 +240,36 @@ def registrar_reserva_google_sheets(dados):
         # Formatar data atual no padrão brasileiro
         data_atual = datetime.now().strftime('%d/%m/%Y')
         
-        # Extrair data e hora da reserva
-        data_hora = dados['data_hora'].split(' ')
-        data_reserva = data_hora[0] if len(data_hora) > 1 else data_atual
-        hora_reserva = data_hora[1] if len(data_hora) > 1 else "12:00"
+        # Tentar converter data/hora para o formato do Sheets
+        try:
+            hora_reserva = dados.get('hora', '12:00')
+            data_reserva = dados.get('data', data_atual)
+        except:
+            data_reserva = data_atual
+            hora_reserva = "12:00"
         
+        # Garantir que todos os campos estão preenchidos
         nova_linha = [
-            f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            dados['cliente'],
-            data_atual,  # Data do registro
-            hora_reserva,
-            dados['origem'],
-            dados['destino'],
-            dados['categoria'],
-            "",  # ID_Motorista
-            "Pendente",
-            dados['valor'],
-            "Avulso",
-            "Pendente",
-            "", "", "", ""  # Campos restantes
+            f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}",  # ID_Reserva
+            dados.get('cliente', 'N/A'),                      # Cliente
+            data_atual,                                       # Data do registro
+            hora_reserva,                                     # Hora_Coleta
+            dados.get('origem', 'N/A'),                       # ID_Local_Origem
+            dados.get('destino', 'N/A'),                      # ID_Local_Destino
+            "Sedan Executivo",                                # Categoria_Veiculo
+            "",                                               # ID_Motorista
+            "Pendente",                                       # Status
+            "300.00",                                         # Valor
+            "Avulso",                                         # Tipo_Faturamento
+            "Pendente",                                       # Status_Faturamento
+            "", "", "", ""                                    # Campos restantes
         ]
         
         app.logger.info(f"Registrando reserva: {nova_linha}")
         sheet.append_row(nova_linha)
         return True
     except Exception as e:
-        app.logger.error(f"Erro ao registrar reserva no Sheets: {str(e)}")
+        app.logger.error(f"Erro detalhado ao registrar reserva: {str(e)}")
         return False
 
 def enviar_email_confirmacao(destinatario, reserva):
@@ -258,35 +307,33 @@ def enviar_email_confirmacao(destinatario, reserva):
 
 # ================= PROCESSADOR DE RESERVAS =================
 def processar_reserva(mensagem, telefone, cliente):
-    """Processa mensagens de reserva com validação avançada"""
+    """Processa mensagens de reserva com NLP simplificado"""
     try:
-        # Padrões de reconhecimento flexíveis
-        padrao1 = re.compile(r'(?:reserva|reservar|quero reservar|preciso de|solicito|pedido)\s*(?:uma)?\s*(.+?)\s+(?:para|->|ate|até|pra)\s+(.+?)(?:\s+com|\s+para|\s+-\s+)(\d+)\s*(?:pessoas|pessoa|pax|p|passageiros?)(?:\s+no dia|\s+dia|\s+em|\s+para|\s+-\s+)(.+)', re.IGNORECASE)
-        padrao2 = re.compile(r'(?:reserva|reservar|quero reservar|preciso de|solicito|pedido)\s*:\s*(.+?)\s*[->]\s*(.+?),\s*(\d+)\s*(?:pessoas?|pax|p),\s*(.+)', re.IGNORECASE)
-        padrao3 = re.compile(r'(?:reserva|reservar|quero reservar|preciso de|solicito|pedido)\s*(?:uma)?\s*(.+?)\s+(?:para|->|ate|até|pra)\s+(.+?)\s*-\s*(\d+)\s*(?:pessoas|pessoa|pax|p|passageiros?)\s*-\s*(.+)', re.IGNORECASE)
+        # Tentar entender formatos livres
+        dados = melhorar_entendimento_reserva(mensagem)
         
-        match = padrao1.match(mensagem) or padrao2.match(mensagem) or padrao3.match(mensagem)
-        
-        if not match:
-            return ("🤔 Não consegui entender os detalhes da reserva. "
+        # Validar dados mínimos
+        if not dados['origem'] or not dados['destino']:
+            return ("🤔 Não consegui identificar origem e destino. "
                     "Poderia tentar novamente? Exemplo:\n\n"
-                    "*Reserva Aeroporto GRU para Hotel Tivoli - 2 pessoas - 15/07 às 14:30*\n\n"
-                    "Ou se preferir, me diga os detalhes em qualquer ordem!")
+                    "*Reserva Aeroporto GRU para Hotel Tivoli - 2 pessoas - 15/07 às 14:30*")
         
-        origem, destino, pessoas, data_hora = match.groups()
-        
-        # Validação básica
-        if not pessoas.isdigit() or int(pessoas) <= 0:
-            return "❌ Número de pessoas inválido. Por favor, informe um número válido (ex: 2 pessoas)."
+        # Dados padrão quando ausentes
+        dados['pessoas'] = dados['pessoas'] or 1
+        dados['data'] = dados['data'] or (datetime.now() + relativedelta(days=1)).strftime('%d/%m/%y')
+        dados['hora'] = dados['hora'] or "12:00"
+        data_hora_completa = f"{dados['data']} {dados['hora']}"
         
         # Estrutura de reserva
         reserva = {
             'cliente': cliente['nome'],
             'telefone': telefone,
-            'origem': origem.strip(),
-            'destino': destino.strip(),
-            'pessoas': int(pessoas),
-            'data_hora': data_hora.strip(),
+            'origem': dados['origem'],
+            'destino': dados['destino'],
+            'pessoas': dados['pessoas'],
+            'data': dados['data'],
+            'hora': dados['hora'],
+            'data_hora': data_hora_completa,
             'status': 'pendente',
             'timestamp': datetime.now().isoformat()
         }
@@ -297,21 +344,21 @@ def processar_reserva(mensagem, telefone, cliente):
         # Integração com Google Sheets
         if registrar_reserva_google_sheets({
             'cliente': cliente['nome'],
-            'origem': origem,
-            'destino': destino,
-            'categoria': "Sedan Executivo",  # Categoria padrão
-            'valor': "300.00",  # Valor estimado
-            'data_hora': data_hora.strip()
+            'origem': dados['origem'],
+            'destino': dados['destino'],
+            'categoria': "Sedan Executivo",
+            'valor': "300.00",
+            'data_hora': data_hora_completa
         }):
             # Atribui motorista e envia confirmação
             motorista = atribuir_motorista("")
             if cliente.get('email'):
                 enviar_email_confirmacao(cliente['email'], {
                     'id': f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                    'origem': origem,
-                    'destino': destino,
-                    'data': data_hora.split()[0] if ' ' in data_hora else datetime.now().strftime('%d/%m/%y'),
-                    'hora': data_hora.split()[1] if ' ' in data_hora else "",
+                    'origem': dados['origem'],
+                    'destino': dados['destino'],
+                    'data': dados['data'],
+                    'hora': dados['hora'],
                     'categoria': "Sedan Executivo",
                     'valor': "300.00"
                 })
@@ -320,10 +367,10 @@ def processar_reserva(mensagem, telefone, cliente):
             return (f"⏳ *Estamos processando sua reserva!*\n\n"
                     f"Em instantes enviaremos todos os detalhes da sua reserva aqui no WhatsApp e por e-mail.\n\n"
                     f"📋 Detalhes preliminares:\n"
-                    f"• Origem: {origem}\n"
-                    f"• Destino: {destino}\n"
-                    f"• Data/Hora: {data_hora}\n"
-                    f"• Passageiros: {pessoas}\n\n"
+                    f"• Origem: {dados['origem']}\n"
+                    f"• Destino: {dados['destino']}\n"
+                    f"• Data/Hora: {data_hora_completa}\n"
+                    f"• Passageiros: {dados['pessoas']}\n\n"
                     f"Aguarde só um momentinho enquanto finalizamos tudo... ⏱️")
         else:
             return "⚠️ Reserva registrada localmente (erro no sistema principal)"
@@ -331,6 +378,35 @@ def processar_reserva(mensagem, telefone, cliente):
     except Exception as e:
         app.logger.error(f"Erro ao processar reserva: {str(e)}")
         return "❌ Ops! Tivemos um problema ao processar sua reserva. Poderia tentar novamente?"
+
+# ================= FUNÇÕES DE RESPOSTA =================
+def responder_ajuda():
+    return ("🆘 *Como posso ajudar?*\n\n"
+            "Você pode:\n"
+            "• Fazer uma *RESERVA* de transporte\n"
+            "• *CANCELAR* uma operação\n"
+            "• Verificar *STATUS* de reservas\n"
+            "• Solicitar *SUPORTE* técnico\n\n"
+            "Me diga o que precisa! 😊")
+
+def responder_status_reservas(telefone):
+    reserva = state_manager.reservas.get(telefone, {})
+    if reserva:
+        return (f"🔍 *Status da sua reserva:*\n\n"
+                f"• Origem: {reserva.get('origem', 'N/A')}\n"
+                f"• Destino: {reserva.get('destino', 'N/A')}\n"
+                f"• Data/Hora: {reserva.get('data_hora', 'N/A')}\n"
+                f"• Status: {reserva.get('status', 'Pendente')}\n\n"
+                f"Precisa de mais informações?")
+    else:
+        return "📭 Você não tem reservas ativas. Digite *RESERVA* para criar uma nova."
+
+def responder_suporte():
+    return ("🛠️ *Suporte Técnico*\n\n"
+            "Para suporte técnico, contate:\n"
+            "• Cleverson: +55 11 97250-8430\n"
+            "• E-mail: suporte@jcm.com\n\n"
+            "Estamos à disposição para ajudar!")
 
 # ================= ROTAS ESSENCIAIS =================
 @app.route('/healthz', methods=['GET', 'HEAD'])
@@ -375,7 +451,21 @@ def processar_mensagem(mensagem_lower, mensagem_original, telefone, cliente):
     estado_atual = state_manager.get_user_state(telefone)
     nome_cliente = cliente['nome'] if cliente['nome'] != "Convidado" else ""
     
-    # Respostas a saudações e perguntas sobre a Aline
+    # ------ COMANDOS GLOBAIS (SEMPRE disponíveis) ------
+    if mensagem_lower in ['ajuda', 'help', 'comandos', 'opções']:
+        return responder_ajuda()
+    
+    if mensagem_lower in ['cancelar', 'parar', 'voltar']:
+        state_manager.set_user_state(telefone, "INICIO")
+        return "Operação cancelada. Como posso ajudar?"
+    
+    if mensagem_lower in ['status', 'minhas reservas', 'ver reservas']:
+        return responder_status_reservas(telefone)
+    
+    if mensagem_lower == 'suporte':
+        return responder_suporte()
+    
+    # ------ RESPOSTAS CONTEXTUAIS ------
     if any(palavra in mensagem_lower for palavra in ["oi", "ola", "olá", "e aí", "bom dia", "boa tarde", "boa noite"]):
         state_manager.set_user_state(telefone, "AGUARDANDO_ACAO")
         return f"{saudacao()}{f', {nome_cliente}' if nome_cliente else ''}! Eu sou a Aline, assistente virtual da JCM. Como posso te ajudar hoje? 😊"
@@ -391,35 +481,11 @@ def processar_mensagem(mensagem_lower, mensagem_original, telefone, cliente):
     if any(palavra in mensagem_lower for palavra in ["obrigad", "agradeço", "valeu", "grato"]):
         return responder_agradecimento()
     
-    # Comandos globais
-    if mensagem_lower in ['ajuda', 'help', 'comandos', 'opções']:
-        return ("🆘 *Como posso ajudar?*\n\n"
-                "Você pode:\n"
-                "• Fazer uma *RESERVA* de transporte\n"
-                "• *CANCELAR* uma reserva existente\n"
-                "• Verificar *STATUS* de reservas\n"
-                "• Solicitar *SUPORTE* técnico\n\n"
-                "Me diga o que precisa! 😊")
-    
-    if mensagem_lower in ['cancelar', 'parar', 'voltar']:
-        state_manager.set_user_state(telefone, "INICIO")
-        return "Operação cancelada. Digite *RESERVA* para novo pedido ou *AJUDA* para ver opções."
-    
-    if mensagem_lower in ['status', 'minhas reservas', 'ver reservas']:
-        return "🔍 Estou verificando suas reservas... Um momento!"
-    
-    if mensagem_lower == 'suporte':
-        return ("🛠️ *Suporte Técnico*\n\n"
-                "Para suporte técnico, contate:\n"
-                "• Cleverson: +55 11 97250-8430\n"
-                "• E-mail: suporte@jcm.com\n\n"
-                "Estamos à disposição para ajudar!")
-    
     # Comandos administrativos
     if mensagem_lower.startswith(("admin ", "administrativo ", "sys ")):
         return processar_comando_admin(mensagem_lower, telefone)
     
-    # Máquina de estados
+    # ------ MÁQUINA DE ESTADOS ------
     if estado_atual == "INICIO":
         if any(palavra in mensagem_lower for palavra in ["reserva", "reservar", "transporte", "carro", "viagem"]):
             state_manager.set_user_state(telefone, "AGUARDANDO_RESERVA")
@@ -440,11 +506,16 @@ def processar_mensagem(mensagem_lower, mensagem_original, telefone, cliente):
             state_manager.set_user_state(telefone, "AGUARDANDO_RESERVA")
             return "📝 Ótimo! Por favor, me envie os detalhes da sua reserva."
         elif "status" in mensagem_lower:
-            return "🔍 Estou verificando suas reservas... Um momento!"
+            return responder_status_reservas(telefone)
         else:
             return "🤔 Desculpe, não entendi. Digite *RESERVA* para nova reserva ou *AJUDA* para ver opções."
     
     elif estado_atual == "AGUARDANDO_RESERVA":
+        # Comando especial: sair do fluxo de reserva
+        if any(palavra in mensagem_lower for palavra in ["sair", "cancelar", "voltar"]):
+            state_manager.set_user_state(telefone, "INICIO")
+            return "✅ Sai do modo reserva. Como posso ajudar?"
+            
         return processar_reserva(mensagem_original, telefone, cliente)
     
     elif estado_atual == "CONFIRMACAO":
