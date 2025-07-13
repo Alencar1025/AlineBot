@@ -5,4 +5,4 @@ twilio==9.2.4
 requests==2.32.4
 google-api-python-client==2.128.0
 waitress==3.0.0
-python-dateutil==2.9.0  # Para manipulação de datas
+python-dateutil==2.9.0
