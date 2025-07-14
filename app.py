@@ -5,7 +5,9 @@ import logging
 import random
 import smtplib
 import gspread
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 from flask import Flask, request, Response
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
@@ -61,7 +63,11 @@ except Exception as e:
 # Inicialização Google Sheets
 if GOOGLE_CREDS and SHEET_KEY:
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        # ESCOPO CORRIGIDO PARA GOOGLE SHEETS V4
+        scope = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
         creds = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDS, scope)
         gc = gspread.authorize(creds)
         app.logger.info("Google Sheets API inicializada com sucesso")
@@ -94,10 +100,10 @@ class UserState:
 
 state_manager = UserState()
 
-# Dados de usuários (serão migrados para Sheets)
+# Dados de usuários
 USUARIOS = {
-    "+5511972508430": {"nome": "Cleverson", "empresa": "JCM", "nivel": 5, "ativo": True},
-    "+5511988216292": {"nome": "Teste", "empresa": "JCM", "nivel": 5, "ativo": True}
+    "+5511972508430": {"nome": "Cleverson", "empresa": "JCM", "nivel": 5, "ativo": True, "email": "cleverson@jcm.com"},
+    "+5511988216292": {"nome": "Teste", "empresa": "JCM", "nivel": 5, "ativo": True, "email": "teste@jcm.com"}
 }
 
 # ================= FUNÇÕES DE HUMANIZAÇÃO =================
@@ -171,6 +177,20 @@ def processar_comando_admin(mensagem, telefone):
         elif re.search(r'atribuir motorista', mensagem, re.IGNORECASE):
             return atribuir_motorista(mensagem)
         
+        elif re.search(r'teste reserva', mensagem, re.IGNORECASE):
+            # Simula uma reserva de teste
+            dados = {
+                'cliente': 'Teste',
+                'origem': 'Aeroporto GRU',
+                'destino': 'Hotel Tivoli',
+                'data': '15/07/25',
+                'hora': '14:30'
+            }
+            if registrar_reserva_google_sheets(dados):
+                return "✅ Reserva de teste registrada com sucesso!"
+            else:
+                return "❌ Falha ao registrar reserva de teste"
+        
         return "Comando administrativo desconhecido"
     
     except Exception as e:
@@ -202,32 +222,29 @@ def parse_data_relativa(data_str):
 def melhorar_entendimento_reserva(texto):
     """Processamento NLP simplificado para entender formatos livres"""
     # Normalização
-    texto = texto.lower().replace("seria", "").replace("gostaria", "").strip()
+    texto = re.sub(r'\b(?:seria|gostaria|preciso?)\b', '', texto, flags=re.IGNORECASE)
+    texto = texto.strip()
     
     # Extração de elementos chave
-    pessoas = re.search(r'(\d+)\s*(pessoas?|pax?|passageiros?)', texto)
-    data_hora = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4}).*?(\d{1,2}:\d{2})', texto) or \
-                re.search(r'(\d{1,2}/\d{1,2}).*?(\d{1,2}:\d{2})', texto) or \
-                re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', texto) or \
+    pessoas = re.search(r'(\d+)\s*(?:pessoas?|pax?|passageiros?)', texto, re.IGNORECASE)
+    data_hora = re.search(r'(\d{1,2}/\d{1,2}(?:/\d{2,4})?)', texto) or \
                 re.search(r'(\d{1,2}/\d{1,2})', texto)
+    hora = re.search(r'(\d{1,2}:\d{2})', texto)
     
     # Extração de origem e destino
     locais = re.split(r'\s+(?:para|pro|pra|->|ate|até|em)\s+', texto, maxsplit=1)
     
     # Tratar datas relativas
     data = None
-    hora = None
     if data_hora:
         data = parse_data_relativa(data_hora.group(1))
-        if data_hora.lastindex >= 2:
-            hora = data_hora.group(2)
     
     return {
         'origem': locais[0].strip() if len(locais) > 0 else None,
-        'destino': locais[1].split(' ', 1)[0].strip() if len(locais) > 1 else None,
+        'destino': locais[1].strip() if len(locais) > 1 else None,
         'pessoas': int(pessoas.group(1)) if pessoas else 1,
         'data': data,
-        'hora': hora
+        'hora': hora.group(1) if hora else None
     }
 
 def registrar_reserva_google_sheets(dados):
@@ -237,39 +254,45 @@ def registrar_reserva_google_sheets(dados):
     try:
         sheet = gc.open_by_key(SHEET_KEY).worksheet("Reservas_JCM")
         
-        # Formatar data atual no padrão brasileiro
-        data_atual = datetime.now().strftime('%d/%m/%Y')
+        # Formatar data atual no padrão brasileiro (dd/mm/yy)
+        data_atual = datetime.now().strftime('%d/%m/%y')
         
-        # Tentar converter data/hora para o formato do Sheets
-        try:
-            hora_reserva = dados.get('hora', '12:00')
-            data_reserva = dados.get('data', data_atual)
-        except:
-            data_reserva = data_atual
-            hora_reserva = "12:00"
+        # Preencher dados padrão se ausentes
+        data_reserva = dados.get('data', data_atual)
+        hora_reserva = dados.get('hora', '00:00')  # Padrão 00:00 como na planilha
         
-        # Garantir que todos os campos estão preenchidos
+        # Gerar ID do motorista no formato CONT_001, CONT_002, etc.
+        motorista_id = f"CONT_{random.randint(1,3):03d}"
+        
+        # ID de reserva único
+        reserva_id = f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        # LISTA DE VALORES COM FORMATO EXIGIDO PELA PLANILHA (16 colunas)
         nova_linha = [
-            f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}",  # ID_Reserva
-            dados.get('cliente', 'N/A'),                      # Cliente
-            data_atual,                                       # Data do registro
-            hora_reserva,                                     # Hora_Coleta
-            dados.get('origem', 'N/A'),                       # ID_Local_Origem
-            dados.get('destino', 'N/A'),                      # ID_Local_Destino
-            "Sedan Executivo",                                # Categoria_Veiculo
-            "",                                               # ID_Motorista
-            "Pendente",                                       # Status
-            "300.00",                                         # Valor
-            "Avulso",                                         # Tipo_Faturamento
-            "Pendente",                                       # Status_Faturamento
-            "", "", "", ""                                    # Campos restantes
+            reserva_id,                          # A: ID_Reserva
+            dados.get('cliente', 'N/A'),         # B: Cliente
+            data_atual,                          # C: Data do registro (hoje)
+            hora_reserva,                        # D: Hora_Coleta
+            dados.get('origem', 'N/A'),          # E: ID_Local_Origem
+            dados.get('destino', 'N/A'),         # F: ID_Local_Destino
+            "Sedan Executivo",                   # G: Categoria_Veiculo
+            motorista_id,                        # H: ID_Motorista
+            "Confirmado",                        # I: Status
+            "300.00",                            # J: Valor
+            "Avulso",                            # K: Tipo_Faturamento
+            "Pendente",                          # L: Status_Faturamento
+            "",                                  # M: Data_Vencimento
+            "",                                  # N: Valor_Entrada
+            "",                                  # O: Link_Pagamento
+            ""                                   # P: Comprovante_Final
         ]
         
         app.logger.info(f"Registrando reserva: {nova_linha}")
         sheet.append_row(nova_linha)
-        return True
+        return reserva_id
     except Exception as e:
-        app.logger.error(f"Erro detalhado ao registrar reserva: {str(e)}")
+        app.logger.error(f"ERRO GOOGLE SHEETS: {str(e)}")
+        app.logger.error(f"Dados: {json.dumps(dados, indent=2)}")
         return False
 
 def enviar_email_confirmacao(destinatario, reserva):
@@ -289,8 +312,10 @@ def enviar_email_confirmacao(destinatario, reserva):
             <li><b>Data/Hora:</b> {reserva['data']} às {reserva['hora']}</li>
             <li><b>Veículo:</b> {reserva['categoria']}</li>
             <li><b>Valor:</b> R$ {reserva['valor']}</li>
+            <li><b>Motorista:</b> {reserva['motorista']}</li>
         </ul>
         <p>Acompanhe seu motorista em tempo real pelo nosso app.</p>
+        <p>Obrigada por escolher a JCM Transportes!</p>
         """
         
         msg.attach(MIMEText(corpo, 'html'))
@@ -304,6 +329,73 @@ def enviar_email_confirmacao(destinatario, reserva):
     except Exception as e:
         app.logger.error(f"Erro ao enviar e-mail: {str(e)}")
         return False
+
+# ================= SISTEMA DE LEMBRETES =================
+def agendar_lembretes(reserva):
+    try:
+        # Converter data/hora da reserva
+        data_reserva = datetime.strptime(f"{reserva['data']} {reserva['hora']}", '%d/%m/%y %H:%M')
+        
+        # Lembrete 1 dia antes
+        lembrete_1_dia = data_reserva - timedelta(days=1)
+        threading.Timer(
+            (lembrete_1_dia - datetime.now()).total_seconds(),
+            enviar_lembrete,
+            args=[reserva, "1 dia"]
+        ).start()
+        
+        # Lembrete 5 horas antes
+        lembrete_5_horas = data_reserva - timedelta(hours=5)
+        threading.Timer(
+            (lembrete_5_horas - datetime.now()).total_seconds(),
+            enviar_lembrete,
+            args=[reserva, "5 horas"]
+        ).start()
+        
+        # Lembrete para o motorista
+        threading.Timer(
+            (lembrete_1_dia - datetime.now()).total_seconds(),
+            enviar_lembrete_motorista,
+            args=[reserva, "1 dia"]
+        ).start()
+        
+        threading.Timer(
+            (lembrete_5_horas - datetime.now()).total_seconds(),
+            enviar_lembrete_motorista,
+            args=[reserva, "5 horas"]
+        ).start()
+        
+    except Exception as e:
+        app.logger.error(f"Erro ao agendar lembretes: {str(e)}")
+
+def enviar_lembrete(reserva, tempo_antecedencia):
+    try:
+        if twilio_client:
+            mensagem = (
+                f"⏰ Lembrete de Reserva JCM\n\n"
+                f"Faltam {tempo_antecedencia} para seu transporte!\n\n"
+                f"ID Reserva: {reserva['id']}\n"
+                f"Origem: {reserva['origem']}\n"
+                f"Destino: {reserva['destino']}\n"
+                f"Data/Hora: {reserva['data']} {reserva['hora']}\n"
+                f"Motorista: {reserva['motorista']}\n\n"
+                f"Precisa de ajuda? Responda esta mensagem!"
+            )
+            
+            twilio_client.messages.create(
+                body=mensagem,
+                from_=TWILIO_PHONE_NUMBER,
+                to=reserva['telefone']
+            )
+    except Exception as e:
+        app.logger.error(f"Erro ao enviar lembrete: {str(e)}")
+
+def enviar_lembrete_motorista(reserva, tempo_antecedencia):
+    try:
+        # Simulação - na prática precisaria do número do motorista
+        app.logger.info(f"Lembrete para motorista {reserva['motorista']}: Reserva {reserva['id']} em {tempo_antecedencia}")
+    except Exception as e:
+        app.logger.error(f"Erro ao enviar lembrete para motorista: {str(e)}")
 
 # ================= PROCESSADOR DE RESERVAS =================
 def processar_reserva(mensagem, telefone, cliente):
@@ -324,6 +416,9 @@ def processar_reserva(mensagem, telefone, cliente):
         dados['hora'] = dados['hora'] or "12:00"
         data_hora_completa = f"{dados['data']} {dados['hora']}"
         
+        # Atribuir motorista
+        motorista = f"CONT_{random.randint(1,3):03d}"
+        
         # Estrutura de reserva
         reserva = {
             'cliente': cliente['nome'],
@@ -334,46 +429,62 @@ def processar_reserva(mensagem, telefone, cliente):
             'data': dados['data'],
             'hora': dados['hora'],
             'data_hora': data_hora_completa,
-            'status': 'pendente',
+            'motorista': motorista,
+            'status': 'Confirmado',
             'timestamp': datetime.now().isoformat()
         }
         
-        # Registra reserva
+        # Registra reserva localmente
         state_manager.reservas[telefone] = reserva
         
         # Integração com Google Sheets
-        if registrar_reserva_google_sheets({
+        reserva_id = registrar_reserva_google_sheets({
             'cliente': cliente['nome'],
             'origem': dados['origem'],
             'destino': dados['destino'],
-            'categoria': "Sedan Executivo",
-            'valor': "300.00",
-            'data_hora': data_hora_completa
-        }):
-            # Atribui motorista e envia confirmação
-            motorista = atribuir_motorista("")
+            'data': dados['data'],
+            'hora': dados['hora']
+        })
+        
+        if reserva_id:
+            reserva['id'] = reserva_id
+            
+            # Agendar lembretes
+            agendar_lembretes(reserva)
+            
+            # Enviar e-mail de confirmação
             if cliente.get('email'):
                 enviar_email_confirmacao(cliente['email'], {
-                    'id': f"RES_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    'id': reserva_id,
                     'origem': dados['origem'],
                     'destino': dados['destino'],
                     'data': dados['data'],
                     'hora': dados['hora'],
                     'categoria': "Sedan Executivo",
-                    'valor': "300.00"
+                    'valor': "300.00",
+                    'motorista': motorista
                 })
             
-            state_manager.set_user_state(telefone, "CONFIRMACAO")
-            return (f"⏳ *Estamos processando sua reserva!*\n\n"
-                    f"Em instantes enviaremos todos os detalhes da sua reserva aqui no WhatsApp e por e-mail.\n\n"
-                    f"📋 Detalhes preliminares:\n"
+            state_manager.set_user_state(telefone, "MENU_RESERVA")
+            return (f"✅ *Reserva confirmada!* 🚗\n\n"
+                    f"ID da Reserva: {reserva_id}\n"
+                    f"Motorista: {motorista}\n\n"
+                    f"📋 Detalhes:\n"
                     f"• Origem: {dados['origem']}\n"
                     f"• Destino: {dados['destino']}\n"
                     f"• Data/Hora: {data_hora_completa}\n"
                     f"• Passageiros: {dados['pessoas']}\n\n"
-                    f"Aguarde só um momentinho enquanto finalizamos tudo... ⏱️")
+                    f"Enviamos um e-mail com o comprovante completo para {cliente.get('email', 'seu e-mail cadastrado')}.\n\n"
+                    f"*Precisa de algo mais?*\n"
+                    f"1. Alterar reserva\n"
+                    f"2. Cancelar reserva\n"
+                    f"3. Falar com atendente\n"
+                    f"4. Finalizar")
         else:
-            return "⚠️ Reserva registrada localmente (erro no sistema principal)"
+            return ("⚠️ *Reserva registrada localmente!*\n\n"
+                    "Tivemos um problema ao conectar com nosso sistema principal, "
+                    "mas sua reserva foi registrada localmente. Entraremos em contato "
+                    "para confirmar os detalhes.")
             
     except Exception as e:
         app.logger.error(f"Erro ao processar reserva: {str(e)}")
@@ -396,8 +507,13 @@ def responder_status_reservas(telefone):
                 f"• Origem: {reserva.get('origem', 'N/A')}\n"
                 f"• Destino: {reserva.get('destino', 'N/A')}\n"
                 f"• Data/Hora: {reserva.get('data_hora', 'N/A')}\n"
+                f"• Motorista: {reserva.get('motorista', 'A ser definido')}\n"
                 f"• Status: {reserva.get('status', 'Pendente')}\n\n"
-                f"Precisa de mais informações?")
+                f"*Precisa de ajuda com sua reserva?*\n"
+                f"1. Alterar reserva\n"
+                f"2. Cancelar reserva\n"
+                f"3. Falar com atendente\n"
+                f"4. Finalizar")
     else:
         return "📭 Você não tem reservas ativas. Digite *RESERVA* para criar uma nova."
 
@@ -407,6 +523,15 @@ def responder_suporte():
             "• Cleverson: +55 11 97250-8430\n"
             "• E-mail: suporte@jcm.com\n\n"
             "Estamos à disposição para ajudar!")
+
+# ================= MENU PÓS-RESERVA =================
+def menu_pos_reserva(telefone):
+    return (f"*O que gostaria de fazer?*\n\n"
+            f"1. Alterar reserva\n"
+            f"2. Cancelar reserva\n"
+            f"3. Falar com atendente\n"
+            f"4. Finalizar\n\n"
+            f"Digite o número da opção desejada.")
 
 # ================= ROTAS ESSENCIAIS =================
 @app.route('/healthz', methods=['GET', 'HEAD'])
@@ -518,23 +643,44 @@ def processar_mensagem(mensagem_lower, mensagem_original, telefone, cliente):
             
         return processar_reserva(mensagem_original, telefone, cliente)
     
-    elif estado_atual == "CONFIRMACAO":
-        reserva = state_manager.reservas.get(telefone, {})
-        state_manager.set_user_state(telefone, "INICIO")
-        
-        return (f"✅ *Reserva confirmada!*\n\n"
-                f"Aqui estão os detalhes finais:\n"
-                f"• Origem: {reserva.get('origem', 'N/A')}\n"
-                f"• Destino: {reserva.get('destino', 'N/A')}\n"
-                f"• Data/Hora: {reserva.get('data_hora', 'N/A')}\n"
-                f"• Passageiros: {reserva.get('pessoas', 'N/A')}\n"
-                f"• Motorista: CONT_00{random.randint(1,5)}\n\n"
-                f"📬 Enviamos um e-mail com todos os detalhes e comprovante.\n\n"
-                f"Obrigada por escolher a JCM Transportes! 🚗💨\n\n"
-                f"Digite *RESERVA* para novo serviço ou *AJUDA* para ver opções.")
+    elif estado_atual == "MENU_RESERVA":
+        if mensagem_lower in ['1', 'alterar']:
+            state_manager.set_user_state(telefone, "AGUARDANDO_RESERVA")
+            return "Por favor, envie os novos detalhes da reserva."
+        elif mensagem_lower in ['2', 'cancelar']:
+            # Remove a reserva
+            if telefone in state_manager.reservas:
+                del state_manager.reservas[telefone]
+            state_manager.set_user_state(telefone, "INICIO")
+            return "✅ Reserva cancelada. Sentirei sua falta! 😢\n\nComo posso ajudar agora?"
+        elif mensagem_lower in ['3', 'atendente']:
+            state_manager.set_user_state(telefone, "AGUARDANDO_ATENDENTE")
+            return "Um atendente humano entrará em contato em breve. Enquanto isso, posso ajudar em algo mais?"
+        elif mensagem_lower in ['4', 'finalizar']:
+            state_manager.set_user_state(telefone, "INICIO")
+            return "✅ Atendimento finalizado. Estou à disposição se precisar!"
+        else:
+            # Aguarda 10 segundos e pergunta novamente
+            threading.Timer(10.0, enviar_lembrete_menu, args=[telefone]).start()
+            return "❌ Opção inválida. " + menu_pos_reserva(telefone)
+    
+    elif estado_atual == "AGUARDANDO_ATENDENTE":
+        # Aqui poderia registrar a solicitação e notificar um humano
+        return "⌛ Aguarde um momento enquanto conecto você com um atendente..."
     
     return ("🤔 Desculpe, não entendi bem.\n\n"
             "Digite *AJUDA* para ver as opções disponíveis ou *SUPORTE* para falar com nossa equipe.")
+
+def enviar_lembrete_menu(telefone):
+    try:
+        if twilio_client:
+            twilio_client.messages.create(
+                body="⏰ Precisa de algo mais? Estou à disposição para ajudar!",
+                from_=TWILIO_PHONE_NUMBER,
+                to=telefone
+            )
+    except Exception as e:
+        app.logger.error(f"Erro ao enviar lembrete de menu: {str(e)}")
 
 # ================= SERVIDOR PRODUÇÃO =================
 if __name__ == "__main__":
